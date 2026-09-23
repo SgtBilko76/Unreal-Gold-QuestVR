@@ -1,11 +1,15 @@
-# Unreal Gold VR — a Meta Quest port of Unreal Gold
+# Unreal Gold VR — a Meta Quest & PICO port of Unreal Gold
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-SgtBilko76-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/SgtBilko76)
 
 
-A standalone Meta Quest (Quest 2 / Pro / 3 / 3S — developed and tested on Quest 3) VR port of
-**Unreal Gold**, built on [Surreal Engine](https://github.com/dpjudas/SurrealEngine), a
+A standalone VR port of **Unreal Gold** for Meta Quest 2 / Pro / 3 / 3S (developed and tested
+on Quest 3) and, experimentally, PICO 4 / Neo 3 — built on [Surreal Engine](https://github.com/dpjudas/SurrealEngine), a
 from-scratch reimplementation of Unreal Engine 1, with an OpenXR/Vulkan stereo renderer.
+
+The same engine also runs Unreal Tournament in VR — see the sister repository
+[Unreal-Tournament-QuestVR](https://github.com/SgtBilko76/Unreal-Tournament-QuestVR); both apps
+install side by side. More PortRoyale ports at [portroyale.online](https://portroyale.online).
 
 This repository contains **no copyrighted game content** — only engine code. You provide your
 own copy of the game (see below for a free, legal source).
@@ -16,8 +20,11 @@ own copy of the game (see below for a free, legal source).
 * Weapons held in and aimed with the right controller, with a controller-ray crosshair
 * World-anchored curved menu panel operated by pointing and clicking with the controller
 * VR-tuned controls (translator, inventory, crouch on controller buttons), per-weapon hand sizes
-* VR comfort: no view bob, no double-tap dodge; recenter on the Meta button
+* VR comfort: no view bob, no double-tap dodge; recenter on the Meta / Home button
 * Save games persist on the headset
+* Installs side by side with [Unreal Tournament VR](https://github.com/SgtBilko76/Unreal-Tournament-QuestVR) (separate app and data folder)
+* Experimental PICO 4 / Neo 3 support — one APK for both makes, **untested on PICO hardware**;
+  reports are very welcome
 
 ## Getting the game (legal, free)
 
@@ -35,10 +42,11 @@ releases, linked from that page).
 > contents the OldUnreal installer extracts before patching. The `Maps`, `Textures`, `Sounds`,
 > `Music` and `Help` folders are the same either way.
 
-## Installing on the Quest
+## Installing on the headset
 
 1. Install the APK from the [Releases](../../releases) page (sideload with `adb install -r` or
-   SideQuest; developer mode required).
+   [SideQuest](https://sidequestvr.com/setup-howto); developer mode required). SideQuest is a
+   Quest tool — on PICO, sideload with adb.
 2. Copy the game folders to `/sdcard/SurrealEngine/` on the headset so you have:
 
        /sdcard/SurrealEngine/System   Maps   Textures   Sounds   Music   Help
@@ -64,7 +72,7 @@ releases, linked from that page).
 | Left grip (hold) | Crouch |
 | Left Y | Scoreboard |
 | Left menu button | Open / close the game menu |
-| Meta button long-press | Recenter |
+| Meta / Home button long-press | Recenter |
 
 ## Known limitations (engine)
 
@@ -72,7 +80,7 @@ releases, linked from that page).
   or retaliate weakly.
 * Inventory does not carry over between maps.
 * No dynamic lighting; some movers/semisolid brushes behave oddly.
-* Unreal Tournament (436) also runs on this port; other UE1 games are untested in VR.
+* PICO support is brand new and untested on hardware.
 
 ## Building
 
