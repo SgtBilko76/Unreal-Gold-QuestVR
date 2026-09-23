@@ -5,6 +5,13 @@
 #include "Package/PackageManager.h"
 #include "Package/IniProperty.h"
 
+float USurrealClient::RenderBrightness() const
+{
+	if (engine && engine->LaunchInfo.IsUnrealTournament_469())
+		return Brightness * 0.5f;
+	return Brightness;
+}
+
 void USurrealClient::LoadProperties(const NameString& from)
 {
 	NameString name_from = from;

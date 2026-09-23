@@ -16,6 +16,12 @@ public:
 	int FullscreenViewportY = 0;
 	int FullscreenColorBits = 32;
 	float Brightness = 0.5f;
+
+	// Brightness as the render device expects it (0.5 = neutral). OldUnreal's UT 469 rescaled
+	// the ini/slider value so that 1.0 is neutral (its Default.ini ships Brightness=1.000000),
+	// so a 469 install's value is halved here instead of blowing the picture out; the stored
+	// property keeps the game's own scale so the menu slider and SaveConfig round-trip.
+	float RenderBrightness() const;
 	bool UseJoystick = false;
 	bool UseDirectInput = true;
 	int MinDesiredFrameRate = 200;

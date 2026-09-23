@@ -11,7 +11,7 @@
 #include "Packages/Engine/Actors/Info/ULevelInfo.h"
 #include "Packages/Extension/Windows/TabGroup/URootWindow.h"
 
-void VisibleFrame::Process(const vec3& location, const mat4& worldToView, const Coords& viewRotation, bool mirrorFlag, int portalDepth, const Array<PortalSpan>& portalSpans, const vec4& portalPlane)
+void VisibleFrame::Process(const vec3& location, const mat4& worldToView, const Coords& viewRotation, bool mirrorFlag, int portalDepth, const Array<PortalSpan>& portalSpans, const vec4& portalPlane, const mat4* projectionOverride)
 {
 	engine->render->Stats.Frames++;
 
@@ -20,7 +20,7 @@ void VisibleFrame::Process(const vec3& location, const mat4& worldToView, const 
 	MirrorFlag = mirrorFlag;
 	PortalDepth = portalDepth;
 
-	SetupSceneFrame(worldToView);
+	SetupSceneFrame(worldToView, projectionOverride);
 
 	Clipper.numDrawSpans = 0;
 	Clipper.numSurfs = 0;
@@ -41,7 +41,7 @@ void VisibleFrame::Process(const vec3& location, const mat4& worldToView, const 
 	ProcessNode(&engine->Level->Model->Nodes[0]);
 }
 
-void VisibleFrame::SetupSceneFrame(const mat4& worldToView)
+void VisibleFrame::SetupSceneFrame(const mat4& worldToView, const mat4* projectionOverride)
 {
 	Frame.XB = engine->viewport->ViewportX();
 	Frame.YB = engine->viewport->ViewportY();
@@ -93,11 +93,17 @@ void VisibleFrame::SetupSceneFrame(const mat4& worldToView)
 	Frame.ObjectToWorld = mat4::identity();
 	Frame.WorldToView = worldToView;
 	Frame.FovAngle = engine->CameraFovAngle;
-	float Aspect = Frame.FY / Frame.FX;
-	float RProjZ = (float)std::tan(radians(Frame.FovAngle) * 0.5f);
-	float RFX2 = 2.0f * RProjZ / Frame.FX;
-	float RFY2 = 2.0f * RProjZ * Aspect / Frame.FY;
-	Frame.Projection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+
+	if (projectionOverride)
+	{
+		Frame.Projection = *projectionOverride;
+	}
+	else
+	{
+		float Aspect = Frame.FY / Frame.FX;
+		float RProjZ = (float)std::tan(radians(Frame.FovAngle) * 0.5f);
+		Frame.Projection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+	}
 }
 
 void VisibleFrame::ProcessNode(BspNode* node)
@@ -386,6 +392,11 @@ void VisibleFrame::DrawPortals()
 		// BspClipper requires the visible spans list to be sorted
 		std::sort(portal.Spans.begin(), portal.Spans.end(), [](const PortalSpan& a, const PortalSpan& b) { return a.y != b.y ? a.y < b.y: a.x0 < b.x0; });
 
+		// Sub-frames (sky zone, warp zone, mirror) inherit this frame's projection. On desktop that is
+		// the same symmetric FovAngle frustum they would rebuild themselves; in VR it is the per-eye
+		// asymmetric OpenXR frustum (VREyeOverride.Projection via DrawScene()) - rebuilding a symmetric
+		// one here drew the skybox at the wrong scale/offset relative to the eye view (reported on the
+		// Quest 3 as a "blurred" skybox in Unreal Gold).
 		if (portal.SkyZone)
 		{
 			mat4 skyToView =
@@ -395,7 +406,7 @@ void VisibleFrame::DrawPortals()
 				Coords::Location(portal.SkyZone->Location()).ToMatrix();
 
 			VisibleFrame skyframe;
-			skyframe.Process(portal.SkyZone->Location(), skyToView, ViewRotation * Coords::Rotation(portal.SkyZone->Rotation()), MirrorFlag, PortalDepth + 1, portal.Spans);
+			skyframe.Process(portal.SkyZone->Location(), skyToView, ViewRotation * Coords::Rotation(portal.SkyZone->Rotation()), MirrorFlag, PortalDepth + 1, portal.Spans, vec4(0.0f, 0.0f, 0.0f, 1.0f), &Frame.Projection);
 			Device->SetSceneNode(&skyframe.Frame);
 			skyframe.Draw();
 			Device->ClearZ();
@@ -418,7 +429,7 @@ void VisibleFrame::DrawPortals()
 				portalPlane = -portalPlane;
 
 			VisibleFrame portalframe;
-			portalframe.Process(newLocation, worldToView, rotation, MirrorFlag, PortalDepth + 1, portal.Spans, portalPlane);
+			portalframe.Process(newLocation, worldToView, rotation, MirrorFlag, PortalDepth + 1, portal.Spans, portalPlane, &Frame.Projection);
 			Device->SetSceneNode(&portalframe.Frame);
 			portalframe.Draw();
 			Device->ClearZ();
@@ -433,7 +444,7 @@ void VisibleFrame::DrawPortals()
 			mat4 mirrorToView = Frame.WorldToView * mat4::translate(v) * mirrorRotation * mat4::translate(-v);
 
 			VisibleFrame mirrorframe;
-			mirrorframe.Process(ViewLocation.xyz(), mirrorToView, ViewRotation * Coords::FromMatrix(mirrorRotation).Inverse(), !MirrorFlag, PortalDepth + 1, portal.Spans);
+			mirrorframe.Process(ViewLocation.xyz(), mirrorToView, ViewRotation * Coords::FromMatrix(mirrorRotation).Inverse(), !MirrorFlag, PortalDepth + 1, portal.Spans, vec4(0.0f, 0.0f, 0.0f, 1.0f), &Frame.Projection);
 			Device->SetSceneNode(&mirrorframe.Frame);
 			mirrorframe.Draw();
 			Device->ClearZ();

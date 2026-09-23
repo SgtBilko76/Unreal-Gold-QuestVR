@@ -11,6 +11,11 @@ PackageStream::PackageStream(Package* package, std::shared_ptr<File> file) : pac
 {
 }
 
+int64_t PackageStream::GetFileSize() const
+{
+	return file->size();
+}
+
 void PackageStream::ReadBytes(void* d, uint32_t s)
 {
 	file->read(d, s);

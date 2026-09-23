@@ -6,8 +6,12 @@ add_subdirectory(Thirdparty/openmpt)
 add_subdirectory(SurrealGPU)
 add_subdirectory(SurrealWidgets)
 
-if (WIN32 OR APPLE)
+if (WIN32 OR APPLE OR ANDROID)
 	add_subdirectory(Thirdparty/openal-soft)
+endif()
+
+if(ANDROID)
+	add_subdirectory(Thirdparty/OpenXR-SDK)
 endif()
 
 if(APPLE)
@@ -165,6 +169,10 @@ set(SURREALCOMMON_SOURCES
 	SurrealEngine/Video/VideoPlayer.h
 	SurrealEngine/Video/AVIFileReader.h
 	SurrealEngine/Video/AVIHeaders.h
+	SurrealEngine/VR/VRCamera.cpp
+	SurrealEngine/VR/VRCamera.h
+	SurrealEngine/VR/VRInput.cpp
+	SurrealEngine/VR/VRInput.h
 	SurrealEngine/Native/NStatLog.h
 	SurrealEngine/Native/NZoneInfo.cpp
 	SurrealEngine/Native/NNavigationPoint.cpp
@@ -1031,6 +1039,7 @@ source_group("SurrealEngine\\Utils" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_D
 source_group("SurrealEngine\\GC" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/GC/.+")
 source_group("SurrealEngine\\VM" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/VM/.+")
 source_group("SurrealEngine\\Video" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/Video/.+")
+source_group("SurrealEngine\\VR" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/VR/.+")
 source_group("SurrealEngine\\Compiler" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/Compiler/.+")
 source_group("SurrealEngine\\Compiler\\Ast" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/Compiler/Ast/.+")
 source_group("SurrealEngine\\Compiler\\Frontend" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/Compiler/Frontend/.+")
@@ -1055,6 +1064,10 @@ source_group("Thirdparty\\miniz" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}
 
 include_directories(SurrealEngine SurrealWidgets/include Thirdparty SurrealGPU/include Thirdparty/openmpt Thirdparty/openal-soft/include Thirdparty/miniz)
 
+if(ANDROID)
+	include_directories(Thirdparty/OpenXR-SDK/include Thirdparty/OpenXR-SDK/src/common)
+endif()
+
 if(NOT APPLE AND SDL2_FOUND)
 	include_directories(SurrealEngine ${SDL2_INCLUDE_DIRS})
 	if (NOT DEFINED USE_SDL2)
@@ -1075,6 +1088,31 @@ elseif(APPLE)
 	set(THIRDPARTY_SOURCES ${THIRDPARTY_SOURCES} ${THIRDPARTY_UNIX_SOURCES})
 	set(SURREALCOMMON_LIBS ${SURREALCOMMON_LIBS} ${CMAKE_DL_LIBS} OpenAL::OpenAL)
 	add_definitions(-DUNIX -D_UNIX)
+	add_link_options(-pthread)
+elseif(ANDROID)
+	set(SURREALCOMMON_SOURCES ${SURREALCOMMON_SOURCES} ${SURREALCOMMON_ANDROID_SOURCES})
+	set(THIRDPARTY_SOURCES ${THIRDPARTY_SOURCES} ${THIRDPARTY_UNIX_SOURCES})
+
+	# The OpenXR loader .so is not a system library: Gradle extracts it from the
+	# org.khronos.openxr:openxr_loader_for_android AAR into
+	# Projects/Android/build/generated/openxr-loader/jniLibs/${ANDROID_ABI}/ (see
+	# Projects/Android/build.gradle's extractOpenXrLoader task) for APK packaging, but that
+	# location isn't on the NDK link search path, so it must be referenced explicitly here.
+	# extractOpenXrLoader is a preBuild dependency, but externalNativeBuild's own configure
+	# step isn't guaranteed to run after it, so tolerate the file not existing yet at CMake
+	# configure time (a stale/placeholder linker stub is fine - Gradle will have produced the
+	# real .so before the actual link step runs as part of the same invocation).
+	if(NOT DEFINED OPENXR_LOADER_SO)
+		set(OPENXR_LOADER_SO "${CMAKE_CURRENT_SOURCE_DIR}/Projects/Android/build/generated/openxr-loader/jniLibs/${ANDROID_ABI}/libopenxr_loader.so")
+	endif()
+	if(NOT EXISTS "${OPENXR_LOADER_SO}")
+		message(WARNING "OpenXR loader not found at ${OPENXR_LOADER_SO} yet - run the Gradle build (which runs extractOpenXrLoader) before or instead of a standalone CMake configure.")
+	endif()
+	add_library(openxr_loader SHARED IMPORTED)
+	set_target_properties(openxr_loader PROPERTIES IMPORTED_LOCATION "${OPENXR_LOADER_SO}")
+
+	set(SURREALCOMMON_LIBS ${SURREALCOMMON_LIBS} ${CMAKE_DL_LIBS} OpenAL::OpenAL log android openxr_loader)
+	add_definitions(-DUNIX -D_UNIX -DANDROID)
 	add_link_options(-pthread)
 else()
 	set(SURREALCOMMON_SOURCES ${SURREALCOMMON_SOURCES})
@@ -1102,23 +1140,40 @@ add_library(SurrealCommon STATIC ${SURREALCOMMON_SOURCES} ${THIRDPARTY_SOURCES})
 set_target_properties(SurrealCommon PROPERTIES CXX_STANDARD 20)
 target_precompile_headers(SurrealCommon PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/SurrealEngine/Precomp.h>)
 
-add_executable(SurrealEngine WIN32 MACOSX_BUNDLE ${SURREALENGINE_SOURCES})
-target_link_libraries(SurrealEngine SurrealCommon ${SURREALCOMMON_LIBS})
-set_target_properties(SurrealEngine PROPERTIES CXX_STANDARD 20)
+if(ANDROID)
+	# Named "surrealengine" (lowercase) to match System.loadLibrary("surrealengine") in
+	# Projects/Android/java/com/dpjudas/surrealengine/SurrealEngineActivity.java, and built as
+	# a shared library (JNI entry points, no main()) rather than an executable - see
+	# SurrealEngine/MainAndroid.cpp. SurrealEditor/SurrealDebugger are desktop-only tools, not
+	# part of this VR port.
+	add_library(surrealengine SHARED SurrealEngine/MainAndroid.cpp)
+	target_link_libraries(surrealengine SurrealCommon ${SURREALCOMMON_LIBS})
+	set_target_properties(surrealengine PROPERTIES CXX_STANDARD 20)
+else()
+	add_executable(SurrealEngine WIN32 MACOSX_BUNDLE ${SURREALENGINE_SOURCES})
+	target_link_libraries(SurrealEngine SurrealCommon ${SURREALCOMMON_LIBS})
+	set_target_properties(SurrealEngine PROPERTIES CXX_STANDARD 20)
 
-add_executable(SurrealEditor WIN32 MACOSX_BUNDLE ${SURREALEDITOR_SOURCES})
-target_link_libraries(SurrealEditor SurrealCommon ${SURREALCOMMON_LIBS})
-set_target_properties(SurrealEditor PROPERTIES CXX_STANDARD 20)
+	add_executable(SurrealEditor WIN32 MACOSX_BUNDLE ${SURREALEDITOR_SOURCES})
+	target_link_libraries(SurrealEditor SurrealCommon ${SURREALCOMMON_LIBS})
+	set_target_properties(SurrealEditor PROPERTIES CXX_STANDARD 20)
 
-add_executable(SurrealDebugger ${SURREALDEBUGGER_SOURCES})
-target_link_libraries(SurrealDebugger SurrealCommon ${SURREALCOMMON_LIBS})
-set_target_properties(SurrealDebugger PROPERTIES CXX_STANDARD 20)
+	add_executable(SurrealDebugger ${SURREALDEBUGGER_SOURCES})
+	target_link_libraries(SurrealDebugger SurrealCommon ${SURREALCOMMON_LIBS})
+	set_target_properties(SurrealDebugger PROPERTIES CXX_STANDARD 20)
+endif()
 
 if(WIN32)
 	add_custom_command(TARGET SurrealEngine POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:OpenAL::OpenAL>" $<TARGET_FILE_DIR:SurrealEngine>)
 endif()
 
-if(APPLE)
+if(ANDROID)
+	# Game content (Unreal/UnrealTournament/DeusEx files) AND SurrealEngine.pk3 are sideloaded
+	# by the user into the same directory (see SurrealEngine/MainAndroid.cpp's header comment
+	# and SurrealEngine/UI/WidgetResourceData.cpp's ResourceLoaderPK3) rather than bundled in
+	# the APK - so there is nothing to copy/install here; Gradle packages the surrealengine
+	# .so directly via its own externalNativeBuild integration.
+elseif(APPLE)
 	foreach(bundle_target SurrealEngine SurrealEditor)
 		set_property(TARGET ${bundle_target} APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
 		set_property(TARGET ${bundle_target} APPEND PROPERTY INSTALL_RPATH "@executable_path/../Frameworks")
@@ -1148,6 +1203,8 @@ if(MSVC)
 	set_target_properties(SurrealDebugger PROPERTIES LINK_FLAGS_RELWITHDEBINFO /PDBSTRIPPED:${CMAKE_CURRENT_BINARY_DIR}/RelWithDebInfo/SurrealDebugger-stripped.pdb)
 endif()
 
-install(TARGETS SurrealEngine RUNTIME DESTINATION bin BUNDLE DESTINATION app)
-install(TARGETS SurrealEditor RUNTIME DESTINATION bin BUNDLE DESTINATION app)
-install(TARGETS SurrealDebugger RUNTIME DESTINATION bin)
+if(NOT ANDROID)
+	install(TARGETS SurrealEngine RUNTIME DESTINATION bin BUNDLE DESTINATION app)
+	install(TARGETS SurrealEditor RUNTIME DESTINATION bin BUNDLE DESTINATION app)
+	install(TARGETS SurrealDebugger RUNTIME DESTINATION bin)
+endif()

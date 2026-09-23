@@ -343,6 +343,12 @@ public:
 	uint32_t exportIndex = 0;
 	ObjectFlags Flags = ObjectFlags::NoFlags;
 
+	// UE1's RF_InSingularFunc: set while a `singular` function runs on this object so a
+	// re-entrant singular call is skipped instead of recursing (Frame::Call). UT's menus rely
+	// on it, e.g. UMenuAudioClientWindow.ReadOutputRate() re-selects a combo whose change
+	// notification calls ReadOutputRate() again - infinite recursion without this.
+	bool InSingularFunction = false;
+
 	PropertyDataBlock PropertyData;
 	std::shared_ptr<Frame> StateFrame;
 
@@ -364,7 +370,14 @@ public:
 	}
 
 	template<typename T>
-	TypedScriptArray<T> DynamicArray(PropertyDataOffset offset) { return *static_cast<TypedScriptArray<T>*>(PropertyData.Ptr(offset.DataOffset)); }
+	// The ScriptArray lives INLINE in the property data block (UArrayProperty::ElementSize()
+	// is sizeof(ScriptArray); ConstructElement placement-news it there), so wrap its ADDRESS.
+	// This previously reinterpreted the block bytes as a TypedScriptArray - i.e. read the
+	// ScriptArray's first field as if it were a pointer to the array - which made every
+	// dynamic-array accessor (Actor.Touching on UT 469, the Deus Ex / Emitter ones) see
+	// garbage: on 469 the touch system silently never linked anything, and growing the array
+	// crashed inside ScriptArray::Reserve.
+	TypedScriptArray<T> DynamicArray(PropertyDataOffset offset) { return TypedScriptArray<T>(static_cast<ScriptArray*>(PropertyData.Ptr(offset.DataOffset))); }
 
 	template<typename T>
 	static T* Cast(UObject* obj)

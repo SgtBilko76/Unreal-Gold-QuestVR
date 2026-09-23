@@ -1,49 +1,89 @@
-![SEBANNER](Resources/surreal-engine-banner.png)
+# Unreal Gold VR — a Meta Quest port of Unreal Gold
 
-# Welcome to Surreal Engine!
+[![Sponsor](https://img.shields.io/badge/Sponsor-SgtBilko76-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/SgtBilko76)
 
-Surreal Engine is a project that aims to reimplement Unreal Engine 1; currently focused on making Unreal (Gold) and Unreal Tournament (UT99) playable. The scope of this project might expand to cover more UE1 games in the future.
 
-## Current Status
+A standalone Meta Quest (Quest 2 / Pro / 3 / 3S — developed and tested on Quest 3) VR port of
+**Unreal Gold**, built on [Surreal Engine](https://github.com/dpjudas/SurrealEngine), a
+from-scratch reimplementation of Unreal Engine 1, with an OpenXR/Vulkan stereo renderer.
 
-Please refer to [Status.md](Docs/Status.md) for the current status of Surreal Engine!
+This repository contains **no copyrighted game content** — only engine code. You provide your
+own copy of the game (see below for a free, legal source).
 
-## System Requirements
+## Features
 
-* Original copies of the UE1 games you want to run
-* Windows 10+, macOS 15+ or a modern Linux distro
-* A Direct3D 11 or Vulkan capable graphics card (macOS requires a Metal 2+ GPU)
+* Native OpenXR rendering (72 Hz, per-eye asymmetric projection), snap turning, stick locomotion
+* Weapons held in and aimed with the right controller, with a controller-ray crosshair
+* World-anchored curved menu panel operated by pointing and clicking with the controller
+* VR-tuned controls (translator, inventory, crouch on controller buttons), per-weapon hand sizes
+* VR comfort: no view bob, no double-tap dodge; recenter on the Meta button
+* Save games persist on the headset
 
-## Building Surreal Engine
+## Getting the game (legal, free)
 
-Please refer to [Building.md](Docs/Building.md) for details!
+Unreal Gold is available for free from OldUnreal:
 
-## Downloads
+**https://www.oldunreal.com/downloads/unreal/full-game-installers/**
 
-[Nightly builds are available on the Releases section](https://github.com/dpjudas/SurrealEngine/releases/tag/nightly).
+Run the `Unreal_Gold.exe` installer on a PC (Linux/macOS installers are on OldUnreal's GitHub
+releases, linked from that page).
 
-Additionally, Surreal Engine is available on following Linux distributions:
+> **Important — game version:** this port targets Unreal Gold **226b**, the version on the
+> original discs and on GOG/Steam. The OldUnreal installer applies their 227 patch at the end
+> of installation; the 227 **System** files do not work with Surreal Engine yet. Use the
+> original (unpatched) 226b `System` files — e.g. from a GOG/Steam install, or the disc
+> contents the OldUnreal installer extracts before patching. The `Maps`, `Textures`, `Sounds`,
+> `Music` and `Help` folders are the same either way.
 
-* Arch: [AUR](https://aur.archlinux.org/packages/surrealengine-git)
-* Nix: [Package Search](https://search.nixos.org/packages?channel=unstable&show=surreal-engine) | [Quickstart](https://github.com/NixOS/nixpkgs/pull/337069)
+## Installing on the Quest
 
-## How to Play
+1. Install the APK from the [Releases](../../releases) page (sideload with `adb install -r` or
+   SideQuest; developer mode required).
+2. Copy the game folders to `/sdcard/SurrealEngine/` on the headset so you have:
 
-* Run the `SurrealEngine` executable.
-* Add the UE1 games you want in the Folders tab.
-* Select the game you want to play in Games tab.
-* Click "Play"!
+       /sdcard/SurrealEngine/System   Maps   Textures   Sounds   Music   Help
 
-## Discord Server
+   e.g. `adb push "C:\Games\Unreal Gold\System" /sdcard/SurrealEngine/System` — and so on for
+   each folder. Leave out your PC's `Unreal.ini` / `User.ini`; the app keeps its own settings.
+3. Launch **Unreal Gold VR** from the Unknown Sources section of the library and grant
+   "All files access" when asked (needed to read `/sdcard/SurrealEngine`).
 
-Visit us on Discord at https://discord.gg/5AEry4s
+## Controls
 
-## Command Line Parameters
+| Input | Action |
+| --- | --- |
+| Left stick | Move (direction follows snap-turns) |
+| Right stick left/right | Snap-turn 45° |
+| Right stick up/down | Next / previous weapon |
+| Right trigger | Fire (aimed where the crosshair on the gun's ray sits) |
+| Right grip | Alt-fire |
+| Right A | Enter — activate selected inventory item |
+| Right B | F2 — universal translator |
+| Left trigger | Jump |
+| Left X | ] — select next inventory item |
+| Left grip (hold) | Crouch |
+| Left Y | Scoreboard |
+| Left menu button | Open / close the game menu |
+| Meta button long-press | Recenter |
 
-`SurrealEngine [--url=<mapname>] [--engineversion=X] [Path to game folder]`
+## Known limitations (engine)
 
-If no game folder is specified, and the executable isn't in a System folder, the engine will search the registry (Windows only) for the registry keys Epic originally set.
+* Enemy AI is only partially implemented in Surreal Engine — monsters often just stand around
+  or retaliate weakly.
+* Inventory does not carry over between maps.
+* No dynamic lighting; some movers/semisolid brushes behave oddly.
+* Unreal Tournament (436) also runs on this port; other UE1 games are untested in VR.
 
-If no URL is specified it will use the default URL in the ini file (per default the intro map).
+## Building
 
-The `--engineversion` argument overrides the internal version detected by the engine and should only be used for debugging purposes.
+See [Docs/AndroidBeta.md](Docs/AndroidBeta.md) for the Quest APK packaging, and
+[Docs/Building.md](Docs/Building.md) for desktop builds. In short: Android SDK + NDK 27,
+Gradle 8.x, `gradle assembleRelease` in `Projects/Android`.
+
+## Credits and license
+
+* [Surreal Engine](https://github.com/dpjudas/SurrealEngine) by dpjudas and contributors — the
+  Unreal Engine 1 reimplementation this port is built on. See [LICENSE.md](LICENSE.md).
+* VR/OpenXR approach inspired by [Team Beef](https://www.patreon.com/teambeef)'s Quest ports.
+* Unreal and Unreal Gold are trademarks of Epic Games, Inc. This project is not affiliated
+  with Epic Games. No game content is distributed here.

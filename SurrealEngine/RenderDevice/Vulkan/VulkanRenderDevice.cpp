@@ -17,24 +17,73 @@ VulkanRenderDevice::VulkanRenderDevice(Widget* InViewport)
 
 	try
 	{
-		std::shared_ptr<VulkanInstance> instance = VulkanInstanceBuilder()
-			.RequireExtensions(Viewport->GetVulkanInstanceExtensions())
-			.OptionalSwapchainColorspace()
-			.DebugLayer(UseDebugLayer)
-			.Create();
+		bool isVR = Viewport->IsStereoDisplay();
 
-		auto surface = std::make_shared<VulkanSurface>(instance, Viewport->CreateVulkanSurface(instance->Instance));
-		if (!surface)
-			throw std::runtime_error("No vulkan surface found");
-
+		std::shared_ptr<VulkanInstance> instance;
+		std::shared_ptr<VulkanSurface> surface;
 		auto deviceBuilder = VulkanDeviceBuilder();
+
+		if (isVR)
+		{
+			// No VkSurfaceKHR/WSI on this backend - the OpenXR runtime's compositor is the
+			// "presentation target" instead, and it dictates its own required instance/device
+			// extensions and which VkPhysicalDevice must be used (see
+			// SurrealWidgets/src/window/openxr/openxr_display_window.cpp's
+			// GetVulkanInstanceRequirements/GetVulkanDeviceRequirements/
+			// SelectVulkanPhysicalDevice, and window.h's DisplayWindow comment on why
+			// XR_KHR_vulkan_enable - not vulkan_enable2 - keeps SurrealGPU in control of
+			// instance/device creation here rather than the runtime).
+			instance = VulkanInstanceBuilder()
+				.RequireExtensions(Viewport->GetVulkanInstanceRequirements())
+				.OptionalSwapchainColorspace()
+				.DebugLayer(UseDebugLayer)
+				.Create();
+
+			VkPhysicalDevice requiredDevice = Viewport->SelectVulkanPhysicalDevice(instance->Instance);
+			int requiredDeviceIndex = -1;
+			for (size_t i = 0; i < instance->PhysicalDevices.size(); i++)
+			{
+				if (instance->PhysicalDevices[i].Device == requiredDevice)
+				{
+					requiredDeviceIndex = (int)i;
+					break;
+				}
+			}
+			if (requiredDeviceIndex == -1)
+				throw std::runtime_error("The OpenXR runtime's required Vulkan physical device was not found in the enumerated device list");
+
+			for (const std::string& ext : Viewport->GetVulkanDeviceRequirements())
+				deviceBuilder.RequireExtension(ext);
+			deviceBuilder.SelectDevice(requiredDeviceIndex);
+			VkDeviceIndex = requiredDeviceIndex;
+		}
+		else
+		{
+			instance = VulkanInstanceBuilder()
+				.RequireExtensions(Viewport->GetVulkanInstanceExtensions())
+				.OptionalSwapchainColorspace()
+				.DebugLayer(UseDebugLayer)
+				.Create();
+
+			surface = std::make_shared<VulkanSurface>(instance, Viewport->CreateVulkanSurface(instance->Instance));
+			if (!surface || surface->Surface == VK_NULL_HANDLE)
+				throw std::runtime_error("No vulkan surface found");
+
+			deviceBuilder.Surface(surface);
+			deviceBuilder.SelectDevice(VkDeviceIndex);
+		}
+
 		deviceBuilder.OptionalDescriptorIndexing();
 		deviceBuilder.OptionalRayQuery();
-		deviceBuilder.Surface(surface);
 		deviceBuilder.RequireExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
 		deviceBuilder.RequireExtension(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
-		deviceBuilder.SelectDevice(VkDeviceIndex);
-		Device = deviceBuilder.Create(surface->Instance);
+		Device = deviceBuilder.Create(instance);
+
+		if (isVR)
+		{
+			uint32_t queueFamilyIndex = (uint32_t)Device->GraphicsFamily;
+			Viewport->CreateVulkanSession(instance->Instance, Device->PhysicalDevice.Device, Device->device, queueFamilyIndex, 0);
+		}
 
 		bool supportsBindless =
 			Device->EnabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound &&
@@ -112,7 +161,22 @@ void VulkanRenderDevice::SubmitAndWait(bool present, int presentWidth, int prese
 {
 	DescriptorSets->UpdateBindlessSet();
 
-	Commands->SubmitCommands(present, presentWidth, presentHeight, presentFullscreen);
+	Commands->SubmitCommands(present, presentWidth, presentHeight, presentFullscreen, true);
+
+	// A new slot with its own (idle) scene buffers is current now - see BufferManager.
+	Batch.SceneIndexStart = 0;
+	SceneVertexPos = 0;
+	SceneIndexPos = 0;
+}
+
+void VulkanRenderDevice::SubmitAsync()
+{
+	// Bindless descriptor writes only ever target indices no earlier submission referenced
+	// (index reuse goes through ClearCache, which FlushDrawBatchAndWait/Flush precede with a
+	// full wait), so updating the update-after-bind set while older submissions run is fine.
+	DescriptorSets->UpdateBindlessSet();
+
+	Commands->SubmitCommands(false, 0, 0, false, false);
 
 	Batch.SceneIndexStart = 0;
 	SceneVertexPos = 0;
@@ -181,6 +245,7 @@ void VulkanRenderDevice::Lock(vec4 InFlashScale, vec4 InFlashFog, vec4 ScreenCle
 	// If frame textures no longer match the window or user settings, recreate them along with the swap chain
 	if (!Textures->Scene || Textures->Scene->Width != Viewport->GetNativePixelWidth() || Textures->Scene->Height != Viewport->GetNativePixelHeight() ||Textures->Scene->Multisample != GetSettingsMultisample())
 	{
+		Commands->WaitForAll(); // in-flight submissions may still be rendering into the old scene buffers
 		Framebuffers->DestroySceneFramebuffer();
 		Textures->Scene.reset();
 		Textures->Scene.reset(new SceneTextures(this, Viewport->GetNativePixelWidth(), Viewport->GetNativePixelHeight(), GetSettingsMultisample()));
@@ -191,6 +256,16 @@ void VulkanRenderDevice::Lock(vec4 InFlashScale, vec4 InFlashFog, vec4 ScreenCle
 	}
 
 	auto cmdbuffer = Commands->GetDrawCommands();
+
+	// With submissions left in flight (CommandBufferManager), the previous submission's tail
+	// (present pass sampling the postprocess image, bloom passes) may still be executing when
+	// this one starts re-using those same images. The per-image barriers below and in
+	// BlitSceneToPostprocess were written for a wait-every-frame world and don't all name the
+	// previous readers as their source stage, so put one conservative full barrier at the very
+	// start of each submission - a few microseconds once per eye.
+	PipelineBarrier()
+		.AddMemory(VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT)
+		.Execute(cmdbuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
 	// Special thanks to Khronos and AMD for making this absolute hell to use.
 	VkAccessFlags srcColorAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
@@ -277,7 +352,7 @@ void VulkanRenderDevice::Unlock(bool Blit)
 
 	if (Samplers->LODBias != LODBias)
 	{
-		DescriptorSets->ClearCache();
+		ClearDescriptorCache();
 		Textures->ClearAllBindlessIndexes();
 		Samplers->CreateSceneSamplers();
 	}
@@ -984,11 +1059,26 @@ void VulkanRenderDevice::SetSceneNode(SceneNode* Frame)
 	viewportdesc.maxDepth = 1.0f;
 	commands->setViewport(0, 1, &viewportdesc);
 
-	pushconstants.objectToProjection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
-
-	// TBD; do this or do like UE1 does and do the transform on the CPU?
-	// maybe optionally do one or the other? transform on CPU can be super slow --Xaleros
-	pushconstants.objectToProjection = pushconstants.objectToProjection * Frame->WorldToView * Frame->ObjectToWorld;
+	// Use Frame->Projection directly rather than rebuilding a symmetric frustum from
+	// FovAngle/Aspect here: outside VR the two are identical (every SceneNode builder -
+	// VisibleFrame::SetupSceneFrame, RenderCanvas.cpp, RenderDevice.cpp - fills Projection
+	// with this exact formula when there's no override), but in VR, MainFrame.Frame's
+	// Projection is the real per-eye ASYMMETRIC OpenXR frustum (VRCamera::BuildProjection,
+	// threaded through via VREyeOverride.Projection - RenderScene.cpp's DrawScene()), which
+	// differs from a same-FOV-both-eyes symmetric approximation. Rebuilding a symmetric one
+	// here instead silently discarded that asymmetry from every 3D draw call while the
+	// OpenXR compositor was still told (via ProjectionViews[eye].fov,
+	// openxr_display_window.cpp) that the submitted image really was rendered with the true
+	// asymmetric FOV - a mismatch between what was drawn and what the compositor re-warps
+	// the image as, on every frame, independent of distance to anything on screen. This is a
+	// strong match for the long-standing real-hardware "eyes too different / can't fuse"
+	// report (confirmed uniform at all distances, unaffected by every eye-swap/IPD/rotation
+	// change tried, all of which only ever touched WorldToView, never this projection
+	// matrix). RFX2/RFY2 above stay FovAngle-derived on purpose - see DrawTile/Draw3DLine/
+	// Draw2DPoint's screen-space vertex math and Canvas.Frame.Projection's comment
+	// (RenderCanvas.cpp's ResetCanvas()) for why 2D UI intentionally keeps the symmetric
+	// approximation instead of following this same change.
+	pushconstants.objectToProjection = Frame->Projection * Frame->WorldToView * Frame->ObjectToWorld;
 
 	pushconstants.objectToView = Frame->WorldToView * Frame->ObjectToWorld;
 	pushconstants.nearClip = Frame->NearClip;
@@ -1002,7 +1092,7 @@ void VulkanRenderDevice::PrecacheTexture(TextureInfo& Info, uint32_t PolyFlags)
 
 void VulkanRenderDevice::ClearTextureCache()
 {
-	DescriptorSets->ClearCache();
+	ClearDescriptorCache();
 	Textures->ClearCache();
 	Uploads->ClearCache();
 }
@@ -1376,6 +1466,359 @@ PresentPushConstants VulkanRenderDevice::GetPresentPushConstants()
 		}
 	}
 	return pushconstants;
+}
+
+void VulkanRenderDevice::UnlockVR(int eye, int imageIndex, VkImage eyeImage, int width, int height)
+{
+	DrawBatch(Commands->GetDrawCommands());
+	Commands->GetDrawCommands()->endRenderPass();
+
+	BlitSceneToPostprocess();
+	if (Bloom)
+	{
+		RunBloomPass();
+	}
+
+	DrawPresentTextureVR(eye, imageIndex, eyeImage, width, height);
+
+	// No fence wait here: the eye's GPU work runs while the CPU records the next eye / ticks
+	// the next frame (CommandBufferManager's class comment). OpenXR only requires the work to
+	// be QUEUED before xrReleaseSwapchainImage, which the caller does right after this.
+	SubmitAsync();
+
+	Batch.Pipeline = nullptr;
+
+	if (Samplers->LODBias != LODBias)
+	{
+		Commands->WaitForAll(); // pending submissions still reference the old samplers/descriptors
+		ClearDescriptorCache();
+		Textures->ClearAllBindlessIndexes();
+		Samplers->CreateSceneSamplers();
+	}
+
+	// VR path never uses the editor hit-testing readback (HitData/HitSize) - those are only
+	// ever set by SurrealEditor's viewport, which doesn't run on this backend.
+
+	IsLocked = false;
+}
+
+void VulkanRenderDevice::DrawPresentTextureVR(int eye, int imageIndex, VkImage eyeImage, int width, int height)
+{
+	RenderPasses->CreatePresentVRRenderPass(VK_FORMAT_R8G8B8A8_UNORM); // must match OpenXRDisplayWindow::CreateSwapchain's format
+
+	PresentPushConstants pushconstants = GetPresentPushConstants();
+
+	int presentShader = 0;
+	if (GammaMode == 1) presentShader |= 2;
+	if (pushconstants.Brightness != 0.0f || pushconstants.Contrast != 1.0f || pushconstants.Saturation != 1.0f) presentShader |= (clamp(GrayFormula, 0, 2) + 1) << 2;
+
+	VkViewport viewport = {};
+	viewport.width = (float)width;
+	viewport.height = (float)height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+
+	VkRect2D scissor = {};
+	scissor.extent.width = width;
+	scissor.extent.height = height;
+
+	auto cmdbuffer = Commands->GetDrawCommands();
+
+	VulkanFramebuffer* framebuffer = Framebuffers->GetOrCreateVREyeFramebuffer(eye, imageIndex, eyeImage, width, height);
+
+	PipelineBarrier()
+		.AddImage(eyeImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.Execute(cmdbuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	RenderPassBegin()
+		.RenderPass(RenderPasses->PresentVR.RenderPass.get())
+		.Framebuffer(framebuffer)
+		.RenderArea(0, 0, width, height)
+		.AddClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+		.Execute(cmdbuffer);
+	cmdbuffer->setViewport(0, 1, &viewport);
+	cmdbuffer->setScissor(0, 1, &scissor);
+	cmdbuffer->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->PresentVR.Pipeline[presentShader].get());
+	cmdbuffer->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->Present.PipelineLayout.get(), 0, DescriptorSets->GetPresentSet());
+	cmdbuffer->pushConstants(RenderPasses->Present.PipelineLayout.get(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PresentPushConstants), &pushconstants);
+	cmdbuffer->draw(6, 1, 0, 0);
+	cmdbuffer->endRenderPass();
+
+	// Left in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL (not transitioned to PRESENT_SRC_KHR
+	// like the desktop path - that layout is WSI-specific and meaningless here): OpenXR reads
+	// the image directly as a sampled/composited source after xrReleaseSwapchainImage, and
+	// XrSwapchainCreateInfo::usageFlags (openxr_display_window.cpp) only ever requested
+	// COLOR_ATTACHMENT_BIT | SAMPLED_BIT, never a presentation-specific usage.
+}
+
+void VulkanRenderDevice::UnlockScreen(int imageIndex, VkImage screenImage, int width, int height)
+{
+	DrawBatch(Commands->GetDrawCommands());
+	Commands->GetDrawCommands()->endRenderPass();
+
+	BlitSceneToPostprocess();
+	if (Bloom)
+	{
+		RunBloomPass();
+	}
+
+	DrawPresentTextureScreen(imageIndex, screenImage, width, height);
+
+	SubmitAndWait(false, 0, 0, false);
+
+	Batch.Pipeline = nullptr;
+
+	if (Samplers->LODBias != LODBias)
+	{
+		ClearDescriptorCache();
+		Textures->ClearAllBindlessIndexes();
+		Samplers->CreateSceneSamplers();
+	}
+
+	IsLocked = false;
+}
+
+void VulkanRenderDevice::DrawPresentTextureScreen(int imageIndex, VkImage screenImage, int width, int height)
+{
+	// Reuses PresentVR's render pass/pipeline (RenderPassManager::CreatePresentVRRenderPass) -
+	// the screen-layer swapchain is created with the same VK_FORMAT_R8G8B8A8_UNORM format
+	// (OpenXRDisplayWindow::CreateScreenLayerSwapchain), so no separate render pass is needed.
+	RenderPasses->CreatePresentVRRenderPass(VK_FORMAT_R8G8B8A8_UNORM);
+
+	PresentPushConstants pushconstants = GetPresentPushConstants();
+
+	int presentShader = 0;
+	if (GammaMode == 1) presentShader |= 2;
+	if (pushconstants.Brightness != 0.0f || pushconstants.Contrast != 1.0f || pushconstants.Saturation != 1.0f) presentShader |= (clamp(GrayFormula, 0, 2) + 1) << 2;
+
+	VkViewport viewport = {};
+	viewport.width = (float)width;
+	viewport.height = (float)height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+
+	VkRect2D scissor = {};
+	scissor.extent.width = width;
+	scissor.extent.height = height;
+
+	auto cmdbuffer = Commands->GetDrawCommands();
+
+	VulkanFramebuffer* framebuffer = Framebuffers->GetOrCreateScreenFramebuffer(imageIndex, screenImage, width, height);
+
+	PipelineBarrier()
+		.AddImage(screenImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.Execute(cmdbuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	RenderPassBegin()
+		.RenderPass(RenderPasses->PresentVR.RenderPass.get())
+		.Framebuffer(framebuffer)
+		.RenderArea(0, 0, width, height)
+		.AddClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+		.Execute(cmdbuffer);
+	cmdbuffer->setViewport(0, 1, &viewport);
+	cmdbuffer->setScissor(0, 1, &scissor);
+	cmdbuffer->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->PresentVR.Pipeline[presentShader].get());
+	cmdbuffer->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->Present.PipelineLayout.get(), 0, DescriptorSets->GetPresentSet());
+	cmdbuffer->pushConstants(RenderPasses->Present.PipelineLayout.get(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PresentPushConstants), &pushconstants);
+	cmdbuffer->draw(6, 1, 0, 0);
+	cmdbuffer->endRenderPass();
+
+	// Left in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL - see DrawPresentTextureVR's identical
+	// comment on why (OpenXR reads it directly, no WSI-specific transition needed).
+}
+
+void VulkanRenderDevice::ClearDescriptorCache()
+{
+	DescriptorSets->ClearCache();
+	if (MenuTexture)
+	{
+		for (int& index : MenuTexture->BindlessIndex)
+			index = -1;
+	}
+}
+
+void VulkanRenderDevice::EnsureMenuTexture(int width, int height)
+{
+	if (MenuTexture && MenuTextureWidth == width && MenuTextureHeight == height)
+		return;
+
+	Commands->WaitForAll(); // an in-flight eye may still be sampling the old texture
+	MenuTextureFramebuffer.reset();
+	MenuTexture.reset();
+
+	MenuTexture = std::make_unique<CachedTexture>();
+	MenuTexture->image = ImageBuilder()
+		.Size(width, height)
+		.Format(VK_FORMAT_R8G8B8A8_UNORM)
+		.Usage(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+		.DebugName("menuTexture")
+		.Create(Device.get());
+	MenuTexture->imageView = ImageViewBuilder()
+		.Image(MenuTexture->image.get(), VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT)
+		.DebugName("menuTextureView")
+		.Create(Device.get());
+
+	RenderPasses->CreatePresentVRRenderPass(VK_FORMAT_R8G8B8A8_UNORM); // shared with DrawPresentTextureVR/Screen - same format
+
+	MenuTextureFramebuffer = FramebufferBuilder()
+		.RenderPass(RenderPasses->PresentVR.RenderPass.get())
+		.Size(width, height)
+		.AddAttachment(MenuTexture->imageView.get())
+		.DebugName("menuTextureFramebuffer")
+		.Create(Device.get());
+
+	MenuTextureWidth = width;
+	MenuTextureHeight = height;
+}
+
+void VulkanRenderDevice::UnlockMenuTexture(int width, int height)
+{
+	DrawBatch(Commands->GetDrawCommands());
+	Commands->GetDrawCommands()->endRenderPass();
+
+	BlitSceneToPostprocess();
+	if (Bloom)
+	{
+		RunBloomPass();
+	}
+
+	EnsureMenuTexture(width, height);
+
+	// Identity gamma/brightness: the menu texture is UNORM (no sRGB round trip), and it is sampled
+	// back into the 3D scene by DrawMenuWorldQuad, so it must hold LINEAR values. The eye's own
+	// present pass then applies the user's gamma exactly once, to menu panel and world alike.
+	PresentPushConstants pushconstants = {};
+	pushconstants.Contrast = 1.0f;
+	pushconstants.Saturation = 1.0f;
+	pushconstants.Brightness = 0.0f;
+	pushconstants.HdrScale = 1.0f;
+	pushconstants.GammaCorrection = vec4(1.0f);
+	int presentShader = 0;
+
+	VkViewport viewport = {};
+	viewport.width = (float)width;
+	viewport.height = (float)height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+
+	VkRect2D scissor = {};
+	scissor.extent.width = width;
+	scissor.extent.height = height;
+
+	auto cmdbuffer = Commands->GetDrawCommands();
+
+	PipelineBarrier()
+		.AddImage(MenuTexture->image.get(), MenuTexture->imageLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+		.Execute(cmdbuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	RenderPassBegin()
+		.RenderPass(RenderPasses->PresentVR.RenderPass.get())
+		.Framebuffer(MenuTextureFramebuffer.get())
+		.RenderArea(0, 0, width, height)
+		.AddClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+		.Execute(cmdbuffer);
+	cmdbuffer->setViewport(0, 1, &viewport);
+	cmdbuffer->setScissor(0, 1, &scissor);
+	cmdbuffer->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->PresentVR.Pipeline[presentShader].get());
+	cmdbuffer->bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, RenderPasses->Present.PipelineLayout.get(), 0, DescriptorSets->GetPresentSet());
+	cmdbuffer->pushConstants(RenderPasses->Present.PipelineLayout.get(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PresentPushConstants), &pushconstants);
+	cmdbuffer->draw(6, 1, 0, 0);
+	cmdbuffer->endRenderPass();
+
+	// Unlike DrawPresentTextureVR/Screen (left in COLOR_ATTACHMENT_OPTIMAL for OpenXR to
+	// consume directly), this image is sampled by our own bindless texture array in
+	// DrawMenuWorldQuad below, so it needs to end up in SHADER_READ_ONLY_OPTIMAL instead.
+	PipelineBarrier()
+		.AddImage(MenuTexture->image.get(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+		.Execute(cmdbuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	MenuTexture->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	SubmitAsync(); // the eyes' submissions follow on the same queue, so their sampling of MenuTexture is ordered after this by the barrier above
+
+	Batch.Pipeline = nullptr;
+
+	if (Samplers->LODBias != LODBias)
+	{
+		Commands->WaitForAll();
+		ClearDescriptorCache();
+		Textures->ClearAllBindlessIndexes();
+		Samplers->CreateSceneSamplers();
+	}
+
+	IsLocked = false;
+}
+
+void VulkanRenderDevice::DrawMenuWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec2 UVMin, vec2 UVMax)
+{
+	// Nothing rendered yet (menu not active this session, or EnsureMenuTexture hasn't run) -
+	// skip rather than sample garbage/uninitialized memory through the bindless array.
+	if (!MenuTexture || MenuTexture->imageLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+		return;
+
+	uint32_t PolyFlags = ApplyPrecedenceRules(0); // opaque, depth-tested/written like normal level geometry
+
+	SetSceneNode(Frame);
+	SetPipeline(RenderPasses->GetPipeline(PolyFlags));
+
+	ivec4 textureBinds = GetTextureIndexes(PolyFlags, MenuTexture.get());
+
+	// Corners[0..3] are wound top-left, top-right, bottom-right, bottom-left (matching a
+	// typical UI texture's V-down convention) - see Engine::RunVRMenuScreen's comment for how
+	// the world-space positions are derived.
+	const vec2 uvs[4] = { vec2(UVMin.x, UVMin.y), vec2(UVMax.x, UVMin.y), vec2(UVMax.x, UVMax.y), vec2(UVMin.x, UVMax.y) };
+
+	auto alloc = ReserveVertices(4, 6);
+	if (!alloc.vptr)
+		return;
+
+	SceneVertex* vptr = alloc.vptr;
+	uint32_t vpos = alloc.vpos;
+	for (int i = 0; i < 4; i++)
+	{
+		vptr[i].Flags = 0;
+		vptr[i].Position = Corners[i];
+		vptr[i].TexCoord.s = uvs[i].x;
+		vptr[i].TexCoord.t = uvs[i].y;
+		vptr[i].TexCoord2 = vec2(0.0f, 0.0f);
+		vptr[i].TexCoord3 = vec2(0.0f, 0.0f);
+		vptr[i].TexCoord4 = vec2(0.0f, 0.0f);
+		vptr[i].Color = vec4(1.0f, 1.0f, 1.0f, 1.0f);
+		vptr[i].TextureBinds = textureBinds;
+	}
+
+	uint32_t* iptr = alloc.iptr;
+	iptr[0] = vpos + 0; iptr[1] = vpos + 1; iptr[2] = vpos + 2;
+	iptr[3] = vpos + 0; iptr[4] = vpos + 2; iptr[5] = vpos + 3;
+
+	UseVertices(4, 6);
+}
+
+void VulkanRenderDevice::DrawSolidWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec4 Color)
+{
+	uint32_t PolyFlags = ApplyPrecedenceRules(0);
+
+	SetSceneNode(Frame);
+	SetPipeline(RenderPasses->GetPipeline(PolyFlags));
+
+	// Bindless slot 0 is TextureManager's 1x1 white NullTexture, so the vertex color is the
+	// final color - same trick Draw3DLine relies on.
+	ivec4 textureBinds = GetTextureIndexes(PolyFlags, nullptr);
+	vec4 color = ApplyInverseGamma(vec4(Color.x, Color.y, Color.z, 1.0f));
+
+	auto alloc = ReserveVertices(4, 6);
+	if (!alloc.vptr)
+		return;
+
+	SceneVertex* vptr = alloc.vptr;
+	uint32_t vpos = alloc.vpos;
+	for (int i = 0; i < 4; i++)
+		vptr[i] = { 0, Corners[i], vec2(0.0f), vec2(0.0f), vec2(0.0f), vec2(0.0f), color, textureBinds };
+
+	uint32_t* iptr = alloc.iptr;
+	iptr[0] = vpos + 0; iptr[1] = vpos + 1; iptr[2] = vpos + 2;
+	iptr[3] = vpos + 0; iptr[4] = vpos + 2; iptr[5] = vpos + 3;
+
+	UseVertices(4, 6);
 }
 
 void VulkanRenderDevice::DrawPresentTexture(int width, int height)

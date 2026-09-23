@@ -365,6 +365,40 @@ void RenderPassManager::CreatePresentPipeline()
 	}
 }
 
+void RenderPassManager::CreatePresentVRRenderPass(VkFormat format)
+{
+	if (PresentVR.RenderPass && PresentVR.Format == format)
+		return; // already built for this format - OpenXR swapchains don't change format mid-session
+
+	PresentVR.RenderPass = RenderPassBuilder()
+		.AddAttachment(
+			format,
+			VK_SAMPLE_COUNT_1_BIT,
+			VK_ATTACHMENT_LOAD_OP_CLEAR,
+			VK_ATTACHMENT_STORE_OP_STORE,
+			VK_IMAGE_LAYOUT_UNDEFINED,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		.AddSubpass()
+		.AddSubpassColorAttachmentRef(0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		.DebugName("PresentVRRenderPass")
+		.Create(renderer->Device.get());
+
+	for (int i = 0; i < 16; i++)
+	{
+		PresentVR.Pipeline[i] = GraphicsPipelineBuilder()
+			.AddVertexShader(renderer->Shaders->Postprocess.VertexShader)
+			.AddFragmentShader(renderer->Shaders->Postprocess.FragmentPresentShader[i])
+			.AddDynamicState(VK_DYNAMIC_STATE_VIEWPORT)
+			.AddDynamicState(VK_DYNAMIC_STATE_SCISSOR)
+			.Layout(Present.PipelineLayout.get())
+			.RenderPass(PresentVR.RenderPass.get())
+			.DebugName("PresentVRPipeline")
+			.Create(renderer->Device.get());
+	}
+
+	PresentVR.Format = format;
+}
+
 void RenderPassManager::CreateScreenshotPipeline()
 {
 	for (int i = 0; i < 16; i++)

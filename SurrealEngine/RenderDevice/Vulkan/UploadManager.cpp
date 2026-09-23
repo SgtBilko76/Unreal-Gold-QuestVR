@@ -241,5 +241,5 @@ void UploadManager::SubmitUploads()
 		tex->inPendingUploads = false;
 	}
 	PendingUploads.clear();
-	UploadBufferPos = 0;
+	// UploadBufferPos is NOT rewound here - see ResetUploadBufferPos().
 }

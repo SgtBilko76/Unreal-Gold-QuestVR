@@ -5,52 +5,72 @@
 
 BufferManager::BufferManager(VulkanRenderDevice* renderer) : renderer(renderer)
 {
-	CreateSceneVertexBuffer();
-	CreateSceneIndexBuffer();
+	CreateSceneVertexBuffers();
+	CreateSceneIndexBuffers();
 	CreateUploadBuffer();
+	SetCurrentSlot(0);
 }
 
 BufferManager::~BufferManager()
 {
-	if (SceneVertices) { SceneVertexBuffer->Unmap(); SceneVertices = nullptr; }
-	if (SceneIndexes) { SceneIndexBuffer->Unmap(); SceneIndexes = nullptr; }
+	for (int i = 0; i < NumSlots; i++)
+	{
+		if (SceneVerticesSlots[i]) { SceneVertexBuffers[i]->Unmap(); SceneVerticesSlots[i] = nullptr; }
+		if (SceneIndexesSlots[i]) { SceneIndexBuffers[i]->Unmap(); SceneIndexesSlots[i] = nullptr; }
+	}
+	SceneVertices = nullptr;
+	SceneIndexes = nullptr;
 	if (UploadData) { UploadBuffer->Unmap(); UploadData = nullptr; }
 }
 
-void BufferManager::CreateSceneVertexBuffer()
+void BufferManager::SetCurrentSlot(int slot)
+{
+	SceneVertexBuffer = SceneVertexBuffers[slot].get();
+	SceneIndexBuffer = SceneIndexBuffers[slot].get();
+	SceneVertices = SceneVerticesSlots[slot];
+	SceneIndexes = SceneIndexesSlots[slot];
+}
+
+void BufferManager::CreateSceneVertexBuffers()
 {
 	size_t size = sizeof(SceneVertex) * SceneVertexBufferSize;
 
-	SceneVertexBuffer = BufferBuilder()
-		.Usage(
-			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-			VMA_MEMORY_USAGE_UNKNOWN, VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT)
-		.MemoryType(
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-		.Size(size)
-		.DebugName("SceneVertexBuffer")
-		.Create(renderer->Device.get());
+	for (int i = 0; i < NumSlots; i++)
+	{
+		SceneVertexBuffers[i] = BufferBuilder()
+			.Usage(
+				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+				VMA_MEMORY_USAGE_UNKNOWN, VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT)
+			.MemoryType(
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+			.Size(size)
+			.DebugName("SceneVertexBuffer")
+			.Create(renderer->Device.get());
 
-	SceneVertices = (SceneVertex*)SceneVertexBuffer->Map(0, size);
+		SceneVerticesSlots[i] = (SceneVertex*)SceneVertexBuffers[i]->Map(0, size);
+	}
 }
 
-void BufferManager::CreateSceneIndexBuffer()
+void BufferManager::CreateSceneIndexBuffers()
 {
 	size_t size = sizeof(uint32_t) * SceneIndexBufferSize;
 
-	SceneIndexBuffer = BufferBuilder()
-		.Usage(
-			VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-			VMA_MEMORY_USAGE_UNKNOWN, VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT)
-		.MemoryType(
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-		.Size(size)
-		.DebugName("SceneIndexBuffer")
-		.Create(renderer->Device.get());
+	for (int i = 0; i < NumSlots; i++)
+	{
+		SceneIndexBuffers[i] = BufferBuilder()
+			.Usage(
+				VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+				VMA_MEMORY_USAGE_UNKNOWN, VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT)
+			.MemoryType(
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+			.Size(size)
+			.DebugName("SceneIndexBuffer")
+			.Create(renderer->Device.get());
 
-	SceneIndexes = (uint32_t*)SceneIndexBuffer->Map(0, size);
+		SceneIndexesSlots[i] = (uint32_t*)SceneIndexBuffers[i]->Map(0, size);
+	}
 }
 
 void BufferManager::CreateUploadBuffer()

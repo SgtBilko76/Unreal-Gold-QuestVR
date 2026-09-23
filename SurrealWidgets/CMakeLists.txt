@@ -4,7 +4,7 @@ project(surrealwidgets)
 option(ENABLE_METAL "Enable Metal support for application rendering" ON)
 option(ENABLE_OPENGL "Enable OpenGL support for application rendering" ON)
 
-if(WIN32)
+if(WIN32 OR ANDROID)
 	option(ENABLE_SDL3 "Enable SDL3 backend. Optional on all platforms" OFF)
 	option(ENABLE_SDL2 "Enable SDL2 backend. Optional on all platforms" OFF)
 else()
@@ -12,7 +12,10 @@ else()
 	option(ENABLE_SDL2 "Enable SDL2 backend. Optional on all platforms" ON)
 endif()
 
-if (UNIX AND NOT APPLE)
+# Desktop-Linux-only: X11/Wayland/dbus/GLib/fontconfig integration. Android has none of these
+# (its own windowing is the OpenXR backend added in the ANDROID branch further down, and its
+# EGL/GLES headers come from the NDK sysroot directly rather than a find_package(OpenGL)).
+if (UNIX AND NOT APPLE AND NOT ANDROID)
 	include(FindPkgConfig)
 	pkg_check_modules(DBUS dbus-1)
 	if (!DBUS_FOUND)
@@ -187,6 +190,10 @@ set(SURREALWIDGETS_UNIX_SOURCES
 	src/core/resourcedata_unix.cpp
 )
 
+set(SURREALWIDGETS_ANDROID_SOURCES
+	src/core/resourcedata_android.cpp
+)
+
 set(SURREALWIDGETS_COCOA_SOURCES
 	src/core/resourcedata_mac.mm
 )
@@ -235,6 +242,15 @@ set(SURREALWIDGETS_WAYLAND_SOURCES
 	src/window/wayland/wl_xdg_dialog_v1.hpp
 	src/window/wayland/wl_xdg_toplevel_icon.cpp
 	src/window/wayland/wl_xdg_toplevel_icon.hpp
+)
+
+set(SURREALWIDGETS_OPENXR_SOURCES
+	src/window/openxr/openxr_display_backend.cpp
+	src/window/openxr/openxr_display_backend.h
+	src/window/openxr/openxr_display_window.cpp
+	src/window/openxr/openxr_display_window.h
+	src/window/openxr/openxr_vulkan_loader.cpp
+	src/window/openxr/openxr_vulkan_loader.h
 )
 
 source_group("src" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/.+")
@@ -349,6 +365,12 @@ elseif(APPLE)
 	if (NOT UNIFORMTYPEIDENTIFIERS_FRAMEWORK)
 		message(FATAL_ERROR "UniformTypeIdentifiers framework not found")
 	endif()
+elseif(ANDROID)
+	set(SURREALWIDGETS_SOURCES ${SURREALWIDGETS_SOURCES} ${SURREALWIDGETS_ANDROID_SOURCES} ${SURREALWIDGETS_OPENXR_SOURCES})
+	set(SURREALWIDGETS_INCLUDE_DIRS ${SURREALWIDGETS_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/Thirdparty/OpenXR-SDK/include ${CMAKE_SOURCE_DIR}/Thirdparty/OpenXR-SDK/src/common)
+	set(SURREALWIDGETS_LIBS ${CMAKE_DL_LIBS} log android)
+	set(SURREALWIDGETS_DEFINES -DUNIX -D_UNIX -DANDROID -DUSE_OPENXR)
+	set(SURREALWIDGETS_LINK_OPTIONS -pthread)
 elseif(HAIKU)
 	set(SURREALWIDGETS_SOURCES ${SURREALWIDGETS_SOURCES} ${SURREALWIDGETS_UNIX_SOURCES})
 	set(SURREALWIDGETS_LIBS ${CMAKE_DL_LIBS})

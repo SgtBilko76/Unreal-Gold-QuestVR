@@ -32,6 +32,7 @@ public:
 
 	Package* GetPackage() const;
 	int GetVersion() const;
+	int64_t GetFileSize() const;
 
 private:
 	Package* package;

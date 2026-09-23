@@ -88,3 +88,76 @@ VulkanFramebuffer* FramebufferManager::GetSwapChainFramebuffer()
 {
 	return SwapChainFramebuffers[renderer->Commands->PresentImageIndex].get();
 }
+
+VulkanFramebuffer* FramebufferManager::GetOrCreateVREyeFramebuffer(int eye, int imageIndex, VkImage image, int width, int height)
+{
+	auto& eyeFramebuffers = VREyeFramebuffers[eye];
+	if ((int)eyeFramebuffers.size() <= imageIndex)
+		eyeFramebuffers.resize(imageIndex + 1);
+
+	VREyeFramebuffer& entry = eyeFramebuffers[imageIndex];
+	if (entry.Framebuffer && entry.Image == image)
+		return entry.Framebuffer.get();
+
+	// The OpenXR runtime is free to hand back a different VkImage for the same swapchain
+	// index across session recreations (uncommon, but not disallowed) - rebuild rather than
+	// assume the index alone is a stable key.
+	entry.Framebuffer.reset();
+	entry.View.reset();
+	entry.WrappedImage.reset();
+
+	entry.Image = image;
+	entry.WrappedImage = std::make_unique<VulkanImage>(renderer->Device.get(), image, nullptr, width, height, 1, 1);
+	entry.View = ImageViewBuilder()
+		.Image(entry.WrappedImage.get(), renderer->RenderPasses->PresentVR.Format, VK_IMAGE_ASPECT_COLOR_BIT)
+		.DebugName("VREyeFramebufferView")
+		.Create(renderer->Device.get());
+	entry.Framebuffer = FramebufferBuilder()
+		.RenderPass(renderer->RenderPasses->PresentVR.RenderPass.get())
+		.Size(width, height)
+		.AddAttachment(entry.View.get())
+		.DebugName("VREyeFramebuffer")
+		.Create(renderer->Device.get());
+
+	return entry.Framebuffer.get();
+}
+
+void FramebufferManager::DestroyVREyeFramebuffers()
+{
+	for (auto& eyeFramebuffers : VREyeFramebuffers)
+		eyeFramebuffers.clear();
+}
+
+VulkanFramebuffer* FramebufferManager::GetOrCreateScreenFramebuffer(int imageIndex, VkImage image, int width, int height)
+{
+	if ((int)ScreenFramebuffers.size() <= imageIndex)
+		ScreenFramebuffers.resize(imageIndex + 1);
+
+	VREyeFramebuffer& entry = ScreenFramebuffers[imageIndex];
+	if (entry.Framebuffer && entry.Image == image)
+		return entry.Framebuffer.get();
+
+	entry.Framebuffer.reset();
+	entry.View.reset();
+	entry.WrappedImage.reset();
+
+	entry.Image = image;
+	entry.WrappedImage = std::make_unique<VulkanImage>(renderer->Device.get(), image, nullptr, width, height, 1, 1);
+	entry.View = ImageViewBuilder()
+		.Image(entry.WrappedImage.get(), renderer->RenderPasses->PresentVR.Format, VK_IMAGE_ASPECT_COLOR_BIT)
+		.DebugName("ScreenFramebufferView")
+		.Create(renderer->Device.get());
+	entry.Framebuffer = FramebufferBuilder()
+		.RenderPass(renderer->RenderPasses->PresentVR.RenderPass.get())
+		.Size(width, height)
+		.AddAttachment(entry.View.get())
+		.DebugName("ScreenFramebuffer")
+		.Create(renderer->Device.get());
+
+	return entry.Framebuffer.get();
+}
+
+void FramebufferManager::DestroyScreenFramebuffers()
+{
+	ScreenFramebuffers.clear();
+}

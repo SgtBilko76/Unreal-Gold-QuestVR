@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 #include <functional>
 #include <cstdint>
 #include <cstdlib>
@@ -19,7 +20,10 @@
 #endif
 
 VK_DEFINE_HANDLE(VkInstance)
+VK_DEFINE_HANDLE(VkPhysicalDevice)
+VK_DEFINE_HANDLE(VkDevice)
 VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkSurfaceKHR)
+VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkImage)
 
 #endif
 
@@ -284,6 +288,51 @@ enum class WidgetType
 	Dialog
 };
 
+// Plain-data head/eye pose and field of view, in the XR runtime's tracking space, using only
+// primitive floats so this header depends on neither <openxr/openxr.h> (an implementation
+// detail of one backend) nor SurrealEngine's vec3/quaternion math types (SurrealWidgets has
+// no dependency on SurrealEngine - it is the other way around). Right-handed, +Y up, +X
+// right, -Z forward (OpenXR's convention); the four FOV angles are half-angles in radians
+// from forward, matching XrFovf. A caller building a render camera converts this into
+// whatever mat4/quaternion types it uses.
+struct StereoEyeView
+{
+	float PositionX, PositionY, PositionZ;
+	float OrientationX, OrientationY, OrientationZ, OrientationW; // quaternion, xyzw
+	float FovAngleLeft, FovAngleRight, FovAngleUp, FovAngleDown; // radians, tangent-space half-angles
+};
+
+// Same tracking-space convention as StereoEyeView, for a hand-held motion controller pose.
+struct MotionControllerPose
+{
+	bool Active = false; // false if the runtime is not currently tracking this controller (e.g. out of view, powered off)
+	float PositionX, PositionY, PositionZ;
+	float OrientationX, OrientationY, OrientationZ, OrientationW; // quaternion, xyzw
+};
+
+enum class VRControllerHand
+{
+	Left,
+	Right
+};
+
+// Digital/analog input this frame from one motion controller. Field names follow the OpenXR
+// standard "simple"/Touch-style interaction profile naming rather than any one headset's
+// button silkscreen labels, since that's what XR_KHR_composition_layer_depth-style APIs
+// converge on and what QuakeQuest's own action set (see
+// Projects/Android/jni/QuakeQuestSrc/OpenXrInput.c) also targets.
+struct VRControllerState
+{
+	float TriggerValue = 0.0f;   // index trigger, 0..1
+	float GripValue = 0.0f;      // grip/squeeze trigger, 0..1
+	float ThumbstickX = 0.0f;    // -1..1
+	float ThumbstickY = 0.0f;    // -1..1
+	bool ButtonA = false;        // A/X (primary face button)
+	bool ButtonB = false;        // B/Y (secondary face button)
+	bool ThumbstickClick = false;
+	bool MenuButton = false;
+};
+
 class DisplayWindow;
 
 class DisplayWindowHost
@@ -378,6 +427,90 @@ public:
 	virtual void SwapGLBuffers() { throw std::runtime_error("SwapOpenGLBuffers not supported for this backend"); }
 	typedef void(*GLFuncPtr)();
 	virtual GLFuncPtr GetGLProcAddress(const char* name) { throw std::runtime_error("GetGLProcAddress not supported for this backend"); }
+
+	// Stereo VR support (OpenXR backend only): there is no VkSurfaceKHR/WSI swapchain to
+	// present to - RenderDevice renders directly into swapchain images the XR runtime
+	// itself owns, once per eye, and xrEndFrame composites them instead of vkQueuePresentKHR.
+	// Default implementations throw so existing (non-VR) backends need no changes; see
+	// SurrealWidgets/src/window/openxr/openxr_display_window.h for the real implementation
+	// and RenderDevice/Vulkan/VulkanRenderDevice.cpp for how it's consumed.
+	virtual bool IsStereoDisplay() { return false; }
+	virtual int GetEyeCount() { throw std::runtime_error("GetEyeCount not supported for this backend"); }
+	virtual void GetEyeImageSize(int eye, int* width, int* height) { throw std::runtime_error("GetEyeImageSize not supported for this backend"); }
+
+	// Extensions the XR runtime's Vulkan graphics binding requires, to be passed into
+	// VulkanInstanceBuilder::RequireExtensions()/VulkanDeviceBuilder::RequireExtension()
+	// before the VkInstance/VkDevice are created.
+	virtual std::vector<std::string> GetVulkanInstanceRequirements() { throw std::runtime_error("GetVulkanInstanceRequirements not supported for this backend"); }
+	virtual std::vector<std::string> GetVulkanDeviceRequirements() { throw std::runtime_error("GetVulkanDeviceRequirements not supported for this backend"); }
+
+	// The specific VkPhysicalDevice the XR runtime's compositor requires. Must be called
+	// after the VkInstance exists (with the extensions above enabled) and before the
+	// VkDevice is created. Match the returned handle against VulkanInstance::PhysicalDevices
+	// to find the index to pass to VulkanDeviceBuilder::SelectDevice().
+	virtual VkPhysicalDevice SelectVulkanPhysicalDevice(VkInstance instance) { throw std::runtime_error("SelectVulkanPhysicalDevice not supported for this backend"); }
+
+	// Creates the XR session bound to this Vulkan device/queue and its per-eye swapchains.
+	// Must be called once, after the VkDevice and graphics queue exist.
+	virtual void CreateVulkanSession(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex) { throw std::runtime_error("CreateVulkanSession not supported for this backend"); }
+
+	// Advances the XR frame loop. WaitFrame() blocks (like vsync) until the runtime wants
+	// the next frame and returns false if nothing should be rendered this iteration (e.g.
+	// session not visible); on true, GetEyeView() returns each eye's pose/FOV for that frame
+	// (valid until the next WaitFrame() call) for building the render camera.
+	// AcquireEyeImage()/ReleaseEyeImage() bracket rendering into one eye's current swapchain
+	// image (returned via GetEyeImage()). EndFrame() submits both eye layers to the
+	// compositor.
+	virtual bool WaitFrame() { throw std::runtime_error("WaitFrame not supported for this backend"); }
+	virtual StereoEyeView GetEyeView(int eye) { throw std::runtime_error("GetEyeView not supported for this backend"); }
+	virtual int AcquireEyeImage(int eye) { throw std::runtime_error("AcquireEyeImage not supported for this backend"); }
+	virtual VkImage GetEyeImage(int eye, int imageIndex) { throw std::runtime_error("GetEyeImage not supported for this backend"); }
+	virtual void ReleaseEyeImage(int eye) { throw std::runtime_error("ReleaseEyeImage not supported for this backend"); }
+	virtual void EndFrame() { throw std::runtime_error("EndFrame not supported for this backend"); }
+
+	// A separate, MONO (non-stereo), world-anchored quad composition layer for 2D UI (the
+	// pause/main menu), submitted alongside the stereo projection layer - matches Team Beef
+	// Studios' QuakeQuest's "big screen" mode (bigScreen/VR_UseScreenLayer(),
+	// TBXR_Common.c/QuakeQuest_OpenXR.c: XrCompositionLayerQuad positioned in front of the
+	// player, offset from the head's STAGE-space position by playerYaw). Unlike the per-eye
+	// projection layer, this content is rendered ONCE (not once per eye) into its own swapchain.
+	// CreateScreenLayerSwapchain() must be called once after CreateVulkanSession(). Each frame
+	// this is wanted: SetScreenLayerActive(true), SetScreenLayerPose(...), Acquire/Get/Release
+	// around rendering exactly like the per-eye Acquire/Get/ReleaseEyeImage calls. When not
+	// wanted, SetScreenLayerActive(false) - EndFrame() then omits the quad layer entirely.
+	virtual void CreateScreenLayerSwapchain(int width, int height) { throw std::runtime_error("CreateScreenLayerSwapchain not supported for this backend"); }
+	virtual void GetScreenLayerImageSize(int* width, int* height) { throw std::runtime_error("GetScreenLayerImageSize not supported for this backend"); }
+	virtual int AcquireScreenLayerImage() { throw std::runtime_error("AcquireScreenLayerImage not supported for this backend"); }
+	virtual VkImage GetScreenLayerImage(int imageIndex) { throw std::runtime_error("GetScreenLayerImage not supported for this backend"); }
+	virtual void ReleaseScreenLayerImage() { throw std::runtime_error("ReleaseScreenLayerImage not supported for this backend"); }
+	// positionX/Y/Z and orientationX/Y/Z/W are in OpenXR STAGE space (same convention as
+	// StereoEyeView/MotionControllerPose) - the caller (Engine::RunVRMenuScreen(), Engine.cpp)
+	// computes these directly in that space (mirroring QuakeQuest's own approach) rather than
+	// via SurrealEngine's UE1 world-space math, since the quad's pose has no gameplay meaning
+	// beyond "a fixed distance in front of wherever the player is standing/facing".
+	// widthMeters/heightMeters size the quad in the real world (XrCompositionLayerQuad::size).
+	virtual void SetScreenLayerPose(float positionX, float positionY, float positionZ, float orientationX, float orientationY, float orientationZ, float orientationW, float widthMeters, float heightMeters) { throw std::runtime_error("SetScreenLayerPose not supported for this backend"); }
+	virtual void SetScreenLayerActive(bool active) { throw std::runtime_error("SetScreenLayerActive not supported for this backend"); }
+
+	// True once after the runtime reported a reference-space change (the headset's recenter
+	// gesture) - the caller re-anchors its tracking-space offsets. Non-VR backends: never.
+	virtual bool ConsumeRecenterEvent() { return false; }
+
+	// VR motion controller support (OpenXR backend only). Valid after WaitFrame() returns
+	// true for the current frame, until the next WaitFrame() call - same lifetime as
+	// GetEyeView().
+	// The head's own central pose (OpenXR VIEW reference space - see HeadSpace in
+	// openxr_display_window.h), distinct from either eye's individual pose (StereoEyeView, from
+	// GetEyeView()). Team Beef Studios' QuakeQuest (TBXR_Common.c: xfStageFromHead) uses this
+	// single, shared head orientation for BOTH eyes' rendering, varying only position (via IPD)
+	// between them - confirmed via real Quest 3 hardware testing to be the right approach after
+	// using each eye's own individually-reported OpenXR orientation (which usually differs only
+	// slightly, but visibly enough) made the two eyes' views feel unacceptably "different" from
+	// each other in a way that reducing eye separation didn't fix.
+	virtual MotionControllerPose GetHeadPose() { throw std::runtime_error("GetHeadPose not supported for this backend"); }
+	virtual MotionControllerPose GetControllerPose(VRControllerHand hand) { throw std::runtime_error("GetControllerPose not supported for this backend"); }
+	virtual VRControllerState GetControllerState(VRControllerHand hand) { throw std::runtime_error("GetControllerState not supported for this backend"); }
+	virtual void TriggerHapticPulse(VRControllerHand hand, float amplitude, float durationSeconds) { throw std::runtime_error("TriggerHapticPulse not supported for this backend"); }
 };
 
 class DisplayBackend
@@ -392,6 +525,7 @@ public:
 	static std::unique_ptr<DisplayBackend> TryCreateX11();
 	static std::unique_ptr<DisplayBackend> TryCreateWayland();
 	static std::unique_ptr<DisplayBackend> TryCreateCocoa();
+	static std::unique_ptr<DisplayBackend> TryCreateOpenXR();
 
 	static std::unique_ptr<DisplayBackend> TryCreateBackend();
 
@@ -403,6 +537,7 @@ public:
 	virtual bool IsX11() { return false; }
 	virtual bool IsWayland() { return false; }
 	virtual bool IsCocoa() { return false; }
+	virtual bool IsOpenXR() { return false; }
 
 	virtual std::unique_ptr<DisplayWindow> Create(DisplayWindowHost* windowHost, WidgetType type, DisplayWindow* owner, RenderAPI renderAPI) = 0;
 	virtual void ProcessEvents() = 0;
@@ -418,3 +553,13 @@ public:
 	virtual std::unique_ptr<SaveFileDialog> CreateSaveFileDialog(DisplayWindow* owner);
 	virtual std::unique_ptr<OpenFolderDialog> CreateOpenFolderDialog(DisplayWindow* owner);
 };
+
+// Must be called once, before DisplayBackend::TryCreateBackend(), on Android - the OpenXR
+// backend needs the JavaVM/Activity to initialize the loader and create the XR instance (see
+// SurrealWidgets/src/window/openxr/openxr_display_window.cpp's CreateInstanceAndSystem), and
+// there is no windowing system on this platform to source them from otherwise. javaVM,
+// activity, and nativeWindow are JavaVM*/jobject/ANativeWindow* respectively, passed as void*
+// so this header (shared with every desktop backend) doesn't need <jni.h>. No-op on backends
+// other than OpenXR (SetAndroidApp on a not-yet-constructed OpenXR backend just records the
+// values for its constructor to pick up - see OpenXRDisplayBackend::SetAndroidApp).
+void SetOpenXRAndroidApp(void* javaVM, void* activity, void* nativeWindow);

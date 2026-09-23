@@ -134,7 +134,7 @@ bool UActor::Destroy()
 
 	CallEvent(this, EventName::Destroyed);
 
-	if (engine->LaunchInfo.IsUnrealTournament_469())
+	if (PropOffsets_Actor.TouchingIsDynamicArray)
 	{
 		for (const auto actor : Touching_UT469())
 			if (actor)

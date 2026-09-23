@@ -8,6 +8,7 @@
 
 #include <surrealwidgets/core/canvas.h>
 #include <surrealwidgets/core/rect.h>
+#include <surrealwidgets/window/window.h> // for the VkImage forward-declare used by *VR() below
 
 class UTexture;
 class UActor;
@@ -121,6 +122,44 @@ public:
 	virtual void PrecacheTexture(TextureInfo& Info, uint32_t PolyFlags) = 0;
 	virtual bool SupportsTextureFormat(TextureFormat Format) = 0;
 	virtual void UpdateTextureRect(TextureInfo& Info, int U, int V, int UL, int VL) = 0;
+
+	// VR path (see SurrealEngine/VR/VRRenderLoop.cpp): like Unlock(true), but presents to one
+	// eye of an OpenXR stereo display (Viewport->IsStereoDisplay()) instead of a desktop
+	// window's swapchain. Default implementation throws, since only VulkanRenderDevice
+	// implements it - the OpenXR DisplayWindow backend itself already rejects any RenderAPI
+	// other than Vulkan (see SurrealWidgets/src/window/openxr/openxr_display_window.cpp), so
+	// GL/D3D11 render devices are never actually asked to do this.
+	virtual void UnlockVR(int eye, int imageIndex, VkImage eyeImage, int width, int height) { throw std::runtime_error("This RenderDevice does not support VR stereo presentation"); }
+
+	// Same idea as UnlockVR, for the mono "big screen" quad layer swapchain (menu/UI) instead
+	// of a per-eye one - see VulkanRenderDevice.h's UnlockScreen comment. Currently unused:
+	// real-hardware testing showed the XrCompositionLayerQuad this fed kept following the
+	// player's head despite byte-identical submitted poses frame to frame, so
+	// Engine::RunVRMenuScreen() now uses UnlockMenuTexture/DrawMenuWorldQuad below instead.
+	// Left in place rather than ripped out - it's self-contained and may be worth revisiting
+	// if that runtime quirk is ever root-caused.
+	virtual void UnlockScreen(int imageIndex, VkImage screenImage, int width, int height) { throw std::runtime_error("This RenderDevice does not support VR screen-layer presentation"); }
+
+	// World-space "big screen" menu quad (Engine::RunVRMenuScreen(), Engine.cpp). Renders the
+	// current 2D menu/UI canvas content into an engine-owned texture (see
+	// VulkanRenderDevice.h's MenuTexture) rather than an OpenXR swapchain image, called once
+	// per app-frame before either eye renders.
+	virtual void UnlockMenuTexture(int width, int height) { throw std::runtime_error("This RenderDevice does not support VR menu-texture rendering"); }
+
+	// Submits that texture as ordinary textured world-space geometry (Corners, world units,
+	// wound consistently for a front-facing quad) during the per-eye Scene pass - called from
+	// RenderSubsystem::DrawEyeVR after DrawScene(), while Frame still holds that eye's
+	// camera transform, so the quad automatically inherits the same already-correct
+	// VREyeOverride/MainFrame.Frame projection ordinary level geometry uses instead of a
+	// separate OpenXR composition layer.
+	// UVMin..UVMax: the texture sub-rectangle this quad shows - the menu canvas only covers a
+	// 4:3 region of the (eye-sized) texture, and the curved panel is built from vertical strips
+	// that each show a slice of it, see Engine::RunVRMenuScreen().
+	virtual void DrawMenuWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec2 UVMin, vec2 UVMax) { throw std::runtime_error("This RenderDevice does not support VR menu-texture rendering"); }
+
+	// Untextured, unlit, solid-color world-space quad (same corner winding as
+	// DrawMenuWorldQuad) - the VR aim reticle (RenderSubsystem::DrawVRAimReticle).
+	virtual void DrawSolidWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec4 Color) { throw std::runtime_error("This RenderDevice does not support solid world quads"); }
 
 	bool ParseCommand(std::string* cmd, const std::string& keyword) { return false; }
 

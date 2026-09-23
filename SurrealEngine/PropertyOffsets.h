@@ -344,6 +344,12 @@ struct PropertyOffsets_Actor
 	PropertyDataOffset TimerCounter;
 	PropertyDataOffset TimerRate;
 	PropertyDataOffset Touching;
+	// True when this game's Actor.Touching is a dynamic array<Actor> (some OldUnreal 469
+	// builds) rather than the classic static Actor[4]. Decided from the loaded class, not the
+	// version number - UActor::Touch/UnTouch and their callers pick the matching accessor
+	// (Touching_UT469() vs Touching()) with it; reading a static [4] through the dynamic
+	// accessor crashes in ScriptArray::Reserve (real 469c install).
+	bool TouchingIsDynamicArray = false;
 	PropertyDataOffset TransientSoundRadius;
 	PropertyDataOffset TransientSoundVolume;
 	PropertyDataOffset TweenRate;

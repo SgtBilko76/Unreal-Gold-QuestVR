@@ -179,6 +179,19 @@ void ExpressionEvaluator::Expr(NewExpression* expr)
 	ExpressionValue flags = Eval(expr->FlagsExpr).Value;
 	UClass* cls = UObject::Cast<UClass>(Eval(expr->ClassExpr).Value.ToObject());
 
+	// `new` with a None class: yield None (the caller then hits the usual "Accessed None"
+	// warnings) instead of aborting the whole engine. Seen with UT's UMenuMenuBar.LoadMods,
+	// which does `new class<UMenuModMenuItem>(DynamicLoadObject(...))` for every mod menu
+	// entry in the .int files - one unloadable mod class would otherwise take the entire
+	// menu down.
+	if (!cls)
+	{
+		LogMessage("new called with a None class - returning None");
+		LogMessage(Frame::GetCallstack());
+		Result.Value = ExpressionValue::ObjectValue(nullptr);
+		return;
+	}
+
 	// To do: package needs to be grabbed from outer, or the "transient package" if it is None, a virtual package for runtime objects
 	Package* package = engine->packages->GetPackage("Engine");
 

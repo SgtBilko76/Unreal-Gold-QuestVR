@@ -115,7 +115,8 @@ std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateBackend()
 
 	if (!backend)
 	{
-		backend = TryCreateWin32();
+		backend = TryCreateOpenXR();
+		if (!backend) backend = TryCreateWin32();
 		if (!backend) backend = TryCreateCocoa();
 		if (!backend) backend = TryCreateWayland();
 		if (!backend) backend = TryCreateX11();
@@ -241,6 +242,24 @@ std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateWayland()
 std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateCocoa()
 {
 	return nullptr;
+}
+
+#endif
+
+#ifdef USE_OPENXR
+
+// DisplayBackend::TryCreateOpenXR() and SetOpenXRAndroidApp() are defined in
+// openxr/openxr_display_backend.cpp
+
+#else
+
+std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateOpenXR()
+{
+	return nullptr;
+}
+
+void SetOpenXRAndroidApp(void* javaVM, void* activity, void* nativeWindow)
+{
 }
 
 #endif

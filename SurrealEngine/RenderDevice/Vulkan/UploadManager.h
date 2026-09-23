@@ -20,6 +20,12 @@ public:
 
 	void SubmitUploads();
 
+	// Rewinds the staging buffer. Only CommandBufferManager calls this, once it knows no
+	// pending submission can still be copying out of the buffer (see its class comment) -
+	// SubmitUploads() itself no longer rewinds, since with in-flight submissions the copies it
+	// records haven't executed yet when it returns.
+	void ResetUploadBufferPos() { UploadBufferPos = 0; }
+
 	void ClearCache();
 
 private:

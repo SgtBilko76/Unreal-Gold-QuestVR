@@ -11,8 +11,17 @@ public:
 	BufferManager(VulkanRenderDevice* renderer);
 	~BufferManager();
 
-	std::unique_ptr<VulkanBuffer> SceneVertexBuffer;
-	std::unique_ptr<VulkanBuffer> SceneIndexBuffer;
+	// One scene vertex/index buffer pair per in-flight submission slot (see
+	// CommandBufferManager): the CPU fills these while the GPU may still be reading the
+	// previous slot's pair, so they can't be shared. SceneVertexBuffer/SceneIndexBuffer and the
+	// mapped pointers always refer to the CURRENT slot's pair - SetCurrentSlot() switches them
+	// in step with CommandBufferManager's slot.
+	static const int NumSlots = 3; // must match CommandBufferManager::NumInFlight
+
+	void SetCurrentSlot(int slot);
+
+	VulkanBuffer* SceneVertexBuffer = nullptr;
+	VulkanBuffer* SceneIndexBuffer = nullptr;
 	std::unique_ptr<VulkanBuffer> UploadBuffer;
 
 	SceneVertex* SceneVertices = nullptr;
@@ -25,9 +34,14 @@ public:
 	static const int UploadBufferSize = 64 * 1024 * 1024;
 
 private:
-	void CreateSceneVertexBuffer();
-	void CreateSceneIndexBuffer();
+	void CreateSceneVertexBuffers();
+	void CreateSceneIndexBuffers();
 	void CreateUploadBuffer();
 
 	VulkanRenderDevice* renderer = nullptr;
+
+	std::unique_ptr<VulkanBuffer> SceneVertexBuffers[NumSlots];
+	std::unique_ptr<VulkanBuffer> SceneIndexBuffers[NumSlots];
+	SceneVertex* SceneVerticesSlots[NumSlots] = {};
+	uint32_t* SceneIndexesSlots[NumSlots] = {};
 };

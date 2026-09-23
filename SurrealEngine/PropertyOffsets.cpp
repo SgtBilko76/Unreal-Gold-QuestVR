@@ -4,6 +4,10 @@
 #include "Package/PackageManager.h"
 #include "Packages/Core/UClass.h"
 #include "Packages/Core/Properties/UProperty.h"
+#include "Packages/Core/Properties/UArrayProperty.h"
+#ifdef ANDROID
+#include <android/log.h>
+#endif
 
 PropertyOffsets_Object PropOffsets_Object;
 
@@ -391,6 +395,15 @@ static void InitPropertyOffsets_Actor(PackageManager* packages)
 	PropOffsets_Actor.TimerCounter = cls->GetPropertyDataOffset("TimerCounter");
 	PropOffsets_Actor.TimerRate = cls->GetPropertyDataOffset("TimerRate");
 	PropOffsets_Actor.Touching = cls->GetPropertyDataOffset("Touching");
+	{
+		UProperty* touchingProp = cls->GetMemberProperty("Touching");
+		PropOffsets_Actor.TouchingIsDynamicArray = touchingProp && dynamic_cast<UArrayProperty*>(touchingProp) != nullptr;
+#ifdef ANDROID
+		__android_log_print(ANDROID_LOG_INFO, "SurrealEngine", "Actor.Touching: %s, ArrayDimension=%d",
+			touchingProp ? (PropOffsets_Actor.TouchingIsDynamicArray ? "dynamic array" : "static/other") : "MISSING",
+			touchingProp ? touchingProp->ArrayDimension : 0);
+#endif
+	}
 	PropOffsets_Actor.TransientSoundRadius = cls->GetPropertyDataOffset("TransientSoundRadius");
 	PropOffsets_Actor.TransientSoundVolume = cls->GetPropertyDataOffset("TransientSoundVolume");
 	PropOffsets_Actor.TweenRate = cls->GetPropertyDataOffset("TweenRate");

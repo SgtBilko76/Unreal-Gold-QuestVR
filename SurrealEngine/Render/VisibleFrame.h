@@ -12,7 +12,10 @@
 class VisibleFrame
 {
 public:
-	void Process(const vec3& location, const mat4& worldToView, const Coords& viewRotation, bool mirrorFlag = false, int portalDepth = 0, const Array<PortalSpan>& portalSpans = {}, const vec4& portalPlane = vec4(0.0f, 0.0f, 0.0f, 1.0f));
+	// projectionOverride: used for VR stereo rendering, where the projection must be an
+	// asymmetric per-eye frustum (see SurrealEngine/VR/VRCamera.h) rather than the symmetric
+	// FovAngle-derived one SetupSceneFrame() builds by default. Null for the normal path.
+	void Process(const vec3& location, const mat4& worldToView, const Coords& viewRotation, bool mirrorFlag = false, int portalDepth = 0, const Array<PortalSpan>& portalSpans = {}, const vec4& portalPlane = vec4(0.0f, 0.0f, 0.0f, 1.0f), const mat4* projectionOverride = nullptr);
 	void Draw();
 	void DrawCoronas();
 
@@ -34,8 +37,12 @@ public:
 	Array<VisibleCorona> Coronas;
 	Array<VisiblePortal> Portals;
 
+	// Fills Frame (viewport rect, matrices) without traversing the BSP - the VR eye pass
+	// uses this on frames where the world isn't drawn at all (console bNoDrawWorld) but the
+	// world-space menu panel still needs this eye's camera (RenderSubsystem::DrawEyeVR).
+	void SetupSceneFrame(const mat4& worldToView, const mat4* projectionOverride);
+
 private:
-	void SetupSceneFrame(const mat4& worldToView);
 	void ProcessNode(BspNode* node);
 	void ProcessNodeSurface(BspNode* node, bool front);
 	void SortTranslucent();

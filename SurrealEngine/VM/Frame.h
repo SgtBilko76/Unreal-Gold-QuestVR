@@ -108,7 +108,20 @@ private:
 
 	struct ActiveCallStackFrame
 	{
-		ActiveCallStackFrame(Frame* frame) { Frame::Callstack.push_back(frame); }
+		ActiveCallStackFrame(Frame* frame)
+		{
+			// Runaway script recursion otherwise ends in a native stack overflow (SIGSEGV with
+			// 500+ nested Frame::Run frames, real Quest 3 hardware) that names no script
+			// function at all; fail with the script callstack instead so it can be diagnosed.
+			if (Frame::Callstack.size() > 300)
+			{
+				std::string stack = Frame::GetCallstack();
+				if (stack.size() > 3000)
+					stack = stack.substr(0, 3000) + "\n...";
+				Frame::ThrowException("Script recursion limit exceeded (300 nested calls). Callstack:\n" + stack);
+			}
+			Frame::Callstack.push_back(frame);
+		}
 		~ActiveCallStackFrame() { Frame::Callstack.pop_back(); }
 	};
 };

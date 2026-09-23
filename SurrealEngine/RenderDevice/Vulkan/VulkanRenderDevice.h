@@ -69,6 +69,33 @@ public:
 	void DrawPresentTexture(int width, int height);
 	PresentPushConstants GetPresentPushConstants();
 
+	// VR path: called by Engine's per-eye render loop (see SurrealEngine/VR/VRRenderLoop.cpp)
+	// once per eye per frame, in place of Unlock(true). Runs the same
+	// DrawBatch/BlitSceneToPostprocess/bloom sequence as Unlock(), then blits the result into
+	// the eye's acquired OpenXR swapchain image instead of the desktop WSI swapchain, and
+	// submits without touching CommandBufferManager's desktop VulkanSwapChain at all.
+	// imageIndex is the index AcquireEyeImage() returned, used only as a cache key for
+	// FramebufferManager's per-eye framebuffer pool.
+	void UnlockVR(int eye, int imageIndex, VkImage eyeImage, int width, int height) override;
+	void DrawPresentTextureVR(int eye, int imageIndex, VkImage eyeImage, int width, int height);
+
+	// "Big screen" quad layer path (Engine::RunVRMenuScreen(), Engine.cpp) - same idea as
+	// UnlockVR/DrawPresentTextureVR, but for the mono screen-layer swapchain instead of a
+	// per-eye one: no eye index, and FramebufferManager::GetOrCreateScreenFramebuffer's own
+	// cache instead of the per-eye one.
+	void UnlockScreen(int imageIndex, VkImage screenImage, int width, int height) override;
+	void DrawPresentTextureScreen(int imageIndex, VkImage screenImage, int width, int height);
+
+	// World-space "big screen" menu quad path (Engine::RunVRMenuScreen(), Engine.cpp) - see
+	// RenderDevice.h's UnlockMenuTexture/DrawMenuWorldQuad comments. Unlike UnlockVR/
+	// UnlockScreen above, the target here (MenuTexture) is a texture VulkanRenderDevice
+	// creates and owns itself (EnsureMenuTexture), not an externally-provided OpenXR
+	// swapchain image - so it's sampled straight from the bindless texture array by
+	// DrawMenuWorldQuad instead of being blitted somewhere else afterward.
+	void UnlockMenuTexture(int width, int height) override;
+	void DrawMenuWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec2 UVMin, vec2 UVMax) override;
+	void DrawSolidWorldQuad(SceneNode* Frame, const vec3 Corners[4], vec4 Color) override;
+
 	struct
 	{
 		int ComplexSurfaces = 0;
@@ -93,6 +120,20 @@ public:
 private:
 	void ClearTextureCache();
 	void BlitSceneToPostprocess();
+
+	// Lazily (re)creates MenuTexture/MenuTextureFramebuffer at the requested size - a no-op
+	// once already built, since the menu canvas size doesn't change at runtime.
+	void EnsureMenuTexture(int width, int height);
+
+	// DescriptorSets->ClearCache() plus forgetting MenuTexture's bindless slots: it isn't in
+	// TextureManager's cache, so ClearAllBindlessIndexes() never touched it and after the
+	// map-load Flush() its stale slot numbers pointed at whatever texture got them next -
+	// the in-game menu panel came up as a flat grey/white card (real Quest 3 hardware).
+	void ClearDescriptorCache();
+	std::unique_ptr<CachedTexture> MenuTexture;
+	std::unique_ptr<VulkanFramebuffer> MenuTextureFramebuffer;
+	int MenuTextureWidth = 0;
+	int MenuTextureHeight = 0;
 
 	struct VertexReserveInfo
 	{
@@ -142,6 +183,9 @@ private:
 	ivec4 GetTextureIndexes(uint32_t PolyFlags, CachedTexture* tex, CachedTexture* lightmap, CachedTexture* macrotex, CachedTexture* detailtex);
 	void DrawBatch(VulkanCommandBuffer* cmdbuffer);
 	void SubmitAndWait(bool present, int presentWidth, int presentHeight, bool presentFullscreen);
+	// VR path: queues the recorded work and returns without waiting for the GPU (see
+	// CommandBufferManager's class comment); the next slot's scene buffers become current.
+	void SubmitAsync();
 
 	vec4 ApplyInverseGamma(vec4 color);
 
@@ -192,7 +236,7 @@ inline ivec4 VulkanRenderDevice::GetTextureIndexes(uint32_t PolyFlags, CachedTex
 	if (DescriptorSets->IsTextureArrayFull())
 	{
 		FlushDrawBatchAndWait();
-		DescriptorSets->ClearCache();
+		ClearDescriptorCache();
 		Textures->ClearAllBindlessIndexes();
 	}
 

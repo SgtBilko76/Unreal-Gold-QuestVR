@@ -158,9 +158,21 @@ private:
 
 	struct OpenStream
 	{
+		// Keyed by the package's FILE PATH, not the Package* alone: a Package object can be
+		// freed (e.g. one whose load threw) and a different package allocated at the same
+		// address, which then silently inherited the dead package's stream - observed on a
+		// UT 469 install where IpDrv.u "failed its signature check" while actually reading a
+		// cached stream of a 543-byte localization text file.
 		Package* Pkg = nullptr;
+		std::string Path;
 		std::shared_ptr<PackageStream> Stream;
 	};
+
+	// Folders from Core.System LangPaths (localization text files, e.g. SystemLocalized/int)
+	// - searched by GetLocalizedString() after the System folder. Deliberately NOT part of the
+	// package scan: registering *.int files as packages gave any text file a package entry
+	// under its stem (OpenGLDrv, SGLDrv, ...), which later blew up in Package::ReadTables.
+	Array<std::string> localizationFolders;
 
 	std::list<OpenStream> openStreams;
 

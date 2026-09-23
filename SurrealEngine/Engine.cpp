@@ -1,5 +1,6 @@
 
 #include "Precomp.h"
+#include <cctype>
 #include "Engine.h"
 #include "Utils/File.h"
 #include "Utils/StrTools.h"
@@ -20,6 +21,7 @@
 #include "Packages/Engine/UCanvas.h"
 #include "Packages/Engine/Actors/UActor.h"
 #include "Packages/Engine/Actors/Pawn/UPlayerPawn.h"
+#include "Packages/Engine/Actors/UHUD.h"
 #include "Packages/Engine/Actors/Info/ULevelInfo.h"
 #include "Packages/Engine/Actors/Info/UGameInfo.h"
 #include "Packages/Engine/Actors/Info/UZoneInfo.h"
@@ -55,6 +57,54 @@
 #include "Math/FrustumPlanes.h"
 #include "GameWindow.h"
 #include "RenderDevice/RenderDevice.h"
+#include "VR/VRInput.h"
+#include "VR/VRCamera.h"
+
+// Temporarily points the player Pawn's Rotation AND ViewRotation at the VR crosshair for the
+// scope's lifetime, restoring both afterwards. UT's PlayerPawn.AdjustAim - which every weapon's
+// fire path goes through - reads ViewRotation (not Rotation), and UT spawns shots at the EYE,
+// so the aim is taken from the head straight at the crosshair's hit point
+// (RenderSubsystem::UpdateVRAimPoint) rather than copying the controller direction: shots land
+// on the crosshair at any range. Used around Level->Tick (weapon state code firing on bFire) and
+// around the synthesized fire key press (UT's `exec function Fire()` fires synchronously).
+struct VRAimOverrideScope
+{
+	VRAimOverrideScope(Engine* engine, bool active)
+	{
+		if (!active || !engine->vrInput || !engine->vrInput->RightControllerActive)
+			return;
+		pawn = UObject::TryCast<UPawn>(engine->viewport->Actor());
+		if (!pawn)
+			return;
+		// Converge from the game's ACTUAL fire origin: CameraLocation includes the VR head raise
+		// (VRCamera::HeadHeightOffsetMeters, Engine::RunVR), but UnrealScript fires from the
+		// unraised pawn eye. Converging from the raised point tilted every shot slightly downward
+		// (observed on Quest 3: impacts consistently landed slightly below the barrel).
+		vec3 fireOrigin = engine->CameraLocation - vec3(0.0f, 0.0f, VRCamera::HeadHeightOffsetMeters * VRCamera::UnitsPerMeter);
+		Rotator aim = engine->render->VRAim.Valid ? Rotator::FromVector(engine->render->VRAim.HitPoint - fireOrigin) : engine->vrInput->GetAimRotation();
+		aim.Roll = 0;
+		savedRotation = pawn->Rotation();
+		savedViewRotation = pawn->ViewRotation();
+		pawn->Rotation() = aim;
+		pawn->ViewRotation() = aim;
+	}
+
+	~VRAimOverrideScope()
+	{
+		if (pawn)
+		{
+			pawn->Rotation() = savedRotation;
+			pawn->ViewRotation() = savedViewRotation;
+		}
+	}
+
+	UPawn* pawn = nullptr;
+	Rotator savedRotation;
+	Rotator savedViewRotation;
+};
+#ifdef ANDROID
+#include <android/log.h>
+#endif
 #include "VM/Frame.h"
 #include "VM/ScriptCall.h"
 #include "Video/VideoPlayer.h"
@@ -110,7 +160,16 @@ Engine::~Engine()
 	if (audiodev)
 		audiodev->ShutdownDevice();
 
-	Logger::Get()->SaveLogAsPlaintext((Directory::localAppData() / "SurrealEngine/SE-Log-LastRun.txt").string());
+	// Best effort: on Android the .config folder may not exist yet, and a throw here (from a
+	// destructor already unwinding an engine error) turned a logged script error into a hard
+	// abort with no message.
+	try
+	{
+		Logger::Get()->SaveLogAsPlaintext((Directory::localAppData() / "SurrealEngine/SE-Log-LastRun.txt").string());
+	}
+	catch (...)
+	{
+	}
 
 	engine = nullptr;
 }
@@ -126,10 +185,23 @@ void Engine::Run()
 
 	OpenWindow();
 
+	if (window->GetRenderDevice()->Viewport->IsStereoDisplay())
+	{
+		vrInput = std::make_unique<VRInput>();
+		// No CreateScreenLayerSwapchain() any more - the menu "big screen" is now drawn as
+		// world-space geometry inside the normal per-eye render (RunVRMenuScreen()), not as a
+		// separate OpenXR quad layer.
+	}
+
 	audiodev->InitDevice();
 	render = std::make_unique<RenderSubsystem>(window->GetRenderDevice());
 
-	if (engine->LaunchInfo.ue1Version > 219 && !client->StartupFullscreen)
+	// VR always: the menu cursor is fed as ABSOLUTE positions (WindowsMouseX/Y from the
+	// controller-ray/panel intersection in RunVRMenuScreen()), and UT's UWindow system only
+	// reads those when bWindowsMouseAvailable is set - otherwise it moves its cursor by relative
+	// mouse deltas that VR never produces (real Quest 3: "menu works but the mouse pointer is
+	// not working"; the Quest session counts as fullscreen, so the desktop rule skipped it).
+	if (engine->LaunchInfo.ue1Version > 219 && (!client->StartupFullscreen || vrInput))
 		viewport->bWindowsMouseAvailable() = true;
 
 	window->LockCursor();
@@ -144,6 +216,14 @@ void Engine::Run()
 
 	if (LaunchInfo.url.empty())
 		LoadMap(GetDefaultURL(packages->GetIniValue("system", "URL", "LocalMap")));
+	else if (UnrealURL(LaunchInfo.url).HasOption("load"))
+	{
+		// --url=?load=N: start on the default map, then let the run loop's deferred travel handling
+		// load save slot N exactly like the in-game Load menu does (used to reproduce save/load
+		// problems from the headset on the desktop build).
+		LoadMap(GetDefaultURL(packages->GetIniValue("system", "URL", "LocalMap")));
+		ClientTravelInfo.URL = UnrealURL(LaunchInfo.url);
+	}
 	else
 		LoadMap(UnrealURL(GetDefaultURL(packages->GetIniValue("system", "URL", "LocalMap")), LaunchInfo.url));
 
@@ -193,6 +273,19 @@ void Engine::Run()
 		LevelInfo->Second() = timedesc->tm_sec;
 		LevelInfo->Millisecond() = 0; // No timedesc equivalent for LevelInfo->Millisecond()
 
+		// VR: refresh controller/head state and push it onto the Pawn (movement axes, fire
+		// buttons, body-facing Rotation()) BEFORE Level->Tick() runs this frame's
+		// movement/physics - the previous ordering called vrInput->Update() only after Tick()
+		// had already run (inside the PlayerCalcView block below, using stale data from last
+		// frame at best), which is why neither controller input nor movement worked at all on
+		// real hardware. Unconditional here (not gated on PlayerCalcView existing) so VR state
+		// stays fresh regardless of which UE1 game/version is running.
+		if (vrInput)
+		{
+			vrInput->Update(window.get(), realTimeElapsed);
+			UpdateVRInput(realTimeElapsed);
+		}
+
 		UpdateInput(realTimeElapsed);
 
 		SetPause(!LevelInfo->Pauser().empty());
@@ -207,9 +300,42 @@ void Engine::Run()
 			LevelInfo->bAggressiveLOD() = false;
 		}
 
-		if (EntryLevel)
-			EntryLevel->Tick(entryLevelElapsed, m_GamePaused);
-		Level->Tick(levelElapsed, m_GamePaused);
+		// VR: temporarily override the Pawn's body Rotation() with the right controller's aim
+		// direction for the duration of this tick, restoring it immediately after. SurrealEngine
+		// has no native "weapon fire direction" function to hook (that logic is compiled
+		// UnrealScript reading Owner.Rotation - see VR/VRInput.h's ApplyAimOverride comment), so
+		// this is the only integration point available without patching game bytecode.
+		// KNOWN RISK (flagged, unverified on real hardware): movement/physics code also reads
+		// Rotation() every tick, so movement direction will follow aim direction during the
+		// tick(s) the trigger is held, not just fire itself. Scoped to only-while-firing
+		// (UPawn::bFire()) to bound the effect, but this needs real-device playtesting to judge
+		// whether it feels acceptable or needs a more surgical hook (e.g. patching the specific
+		// UnrealScript AdjustAim/fire-trace path per weapon class instead).
+		//
+		// Two refinements from Quest 3 testing: (1) UT's PlayerPawn.AdjustAim - which every
+		// weapon's fire path goes through - reads ViewRotation, NOT Rotation, so ViewRotation
+		// (yaw AND pitch) must be
+		// overridden too; overriding Rotation alone left shots going along the body yaw at
+		// zero pitch. (2) UT spawns projectiles/traces at the EYE (Location + draw offset),
+		// while the crosshair sits on the HAND's ray (RenderSubsystem::UpdateVRAimPoint) - a
+		// parallel ray from the eye misses that point by the eye-to-hand offset. So aim from
+		// the head straight AT the crosshair's hit point instead of copying the controller's
+		// direction: shots then land on the crosshair exactly, at any range.
+		//
+		// The same override is applied around the synthesized fire KEY PRESS in UpdateVRInput():
+		// UT's `exec function Fire()` calls Weapon.Fire() synchronously from the key event, i.e.
+		// outside this tick - so without that, the first shot of every trigger pull (every shot,
+		// for single-fire weapons) went along the body yaw at zero pitch (real Quest 3: "shots go
+		// 45 degrees left" after snap-turns, while the crosshair and gun were right).
+		{
+			UPawn* pawn = UObject::TryCast<UPawn>(viewport->Actor());
+			bool firing = pawn && (pawn->bFire() || pawn->bAltFire() || vrAimOverrideAfterRelease > 0.0f);
+			VRAimOverrideScope aimOverride(this, firing);
+
+			if (EntryLevel)
+				EntryLevel->Tick(entryLevelElapsed, m_GamePaused);
+			Level->Tick(levelElapsed, m_GamePaused);
+		}
 
 		if (dxRootWindow)
 			dxRootWindow->Tick(levelElapsed); // Should this maybe be realTimeElapsed?
@@ -229,12 +355,25 @@ void Engine::Run()
 				ExpressionValue::Variable(&CameraLocation, vecprop),
 				ExpressionValue::Variable(&CameraRotation, rotprop)
 				});
+
+			// VR: head tracking overrides the script-computed camera rotation only, leaving
+			// viewport->Actor()->Rotation() (the Pawn's body-facing rotation, which drives
+			// movement/physics/weapon-aim script logic) untouched - see VR/VRInput.h and
+			// VR/VRCamera.h for the full head/body/aim split this implements.
+			if (vrInput)
+			{
+				CameraRotation.Yaw = (int)(vrInput->BodyYawRadians * (0x10000 / (2.0f * 3.14159265359f)));
+			}
 		}
 
 		UpdateAudio();
 
 		viewport->SetViewportRect(0, 0, engine->window->GetPixelWidth(), engine->window->GetPixelHeight());
-		render->DrawGame(levelElapsed);
+
+		if (vrInput)
+			RunVR(levelElapsed);
+		else
+			render->DrawGame(levelElapsed);
 
 		// Save the game if there is a request for it
 		if (SaveGameInfo.SaveGameSlot != DONT_SAVE_GAME)
@@ -548,6 +687,13 @@ UConversationList* Engine::GetDeusExMission()
 
 void Engine::UpdateAudio()
 {
+	// VR note: the audio listener currently only follows body yaw (CameraRotation.Yaw is
+	// overridden in Run()'s VR branch), not full head orientation/position - turning your
+	// head in VR doesn't move the stereo audio image the way a real head would. Getting that
+	// right needs CameraLocation/CameraRotation (or a separate listener transform) driven
+	// from vrInput->HeadView via VRCamera the same way the render camera is; left as a
+	// follow-up since it doesn't affect the render/movement/aim decoupling this port
+	// otherwise implements.
 	mat4 translate = mat4::translate(vec3(0.0f) - CameraLocation);
 	mat4 listener = Coords::ViewToAudioDev().ToMatrix() * Coords::Rotation(CameraRotation).ToMatrix() * translate;
 
@@ -781,10 +927,11 @@ void Engine::LoadFromSaveFile(const UnrealURL& url)
 	{
 		slotNum = Convert::to_uint32(url.GetOption("load"));
 		savefilePackage = packages->LoadSaveSlot(slotNum);
+		LogMessage("Load save slot " + std::to_string(slotNum) + ": " + (savefilePackage ? "found package " + savefilePackage->GetPackageName().ToString() : "NOT FOUND in " + packages->GetSaveFolderPath().string()));
 	}
 
 	if (!savefilePackage)
-		return;
+		return; // silently keeps the current level - the log line above is the only trace
 
 	audiodev->StopSounds();
 	UnloadMap();
@@ -909,6 +1056,13 @@ void Engine::SaveGameToSlot(int32_t slotNum, const std::string& saveDescription)
 		// map name, so record the real map name here for LoadFromSaveFile() to recover.
 		packages->SetIniValue("user", "SaveGame", "MapName" + std::to_string(slotNum), Level->package->GetPackageName().ToString());
 	}
+
+	// Flush the ini files now. The in-memory config (this slot's MapName above, and the menu's
+	// SlotNames[] written by UMenu's SaveConfig() just before it issued "SaveGame N") was
+	// otherwise only written at a clean engine shutdown - which never happens when the app is
+	// simply killed, as it routinely is on the Quest. The .usa file then existed on disk but the
+	// Load menu showed "..Empty.." (saves appeared lost after closing the app).
+	packages->SaveAllIniFiles();
 }
 
 std::map<std::string, std::string> Engine::CreateTravelInfo(bool transferItems)
@@ -1517,6 +1671,485 @@ void Engine::LoadKeybindings()
 	}
 }
 
+// VR: feeds vrInput's per-frame controller state into the Pawn's movement/action properties,
+// bypassing the desktop keybinding-string machinery (activeInputAxes/activeInputButtons,
+// InputCommand) entirely - that system is built around discrete keyboard press/release events
+// resolved through User.ini alias strings (e.g. "MoveForward" -> "Axis aBaseY Speed=+300.0"),
+// which doesn't fit a continuously-varying analog thumbstick well. Written directly here
+// instead, matching the same property names those aliases ultimately target (confirmed against
+// a real UT99 User.ini: aBaseY=forward/back, aStrafe=left/right, aBaseX=turn, aUp=jump,
+// bFire/bAltFire=trigger/grip). Called once per frame, before UpdateInput() so a real keyboard
+// (if one happens to be connected) can still layer on top without being immediately overwritten
+// - though VR is expected to be the sole input source in practice.
+void Engine::UpdateVRInput(float timeElapsed)
+{
+	if (!vrInput)
+		return;
+
+	// Left controller's Menu button opens/closes the pause/main menu exactly like the desktop
+	// Escape key - synthesized as a real IK_Escape press so it goes through the normal
+	// keybinding/menu-opening path (Engine::OnWindowKeyDown, Engine.cpp) rather than needing to
+	// reverse-engineer how URootWindow gets created. Checked unconditionally (not gated on
+	// viewport->Actor(), unlike the movement/fire block below) so the menu can still be opened
+	// even without a live Pawn (e.g. from a death/spectator state). Also toggles the "big
+	// screen" quad (vrBigScreenActive, see its own comment) in lockstep - the quad's visibility
+	// is driven directly by this same button press, not by trying to detect the game's own UI
+	// state.
+	if (vrInput->MenuButtonJustPressed)
+	{
+		InputEvent(EInputKey::IK_Escape, EInputType::IST_Press, 0);
+		vrBigScreenManualToggle = !vrBigScreenManualToggle;
+	}
+
+	// Left grip: crouch. Unreal binds C to "Duck" ("Button bDuck | Axis aUp Speed=-300"), a HELD
+	// command, so this is a real IK_C press on squeeze and release on let-go. Kept
+	// ahead of the menu/pawn early-outs below so the release always reaches the game.
+	if (vrInput->CrouchJustPressed)
+		InputEvent(EInputKey::IK_C, EInputType::IST_Press, 0);
+	if (vrInput->CrouchJustReleased)
+		InputEvent(EInputKey::IK_C, EInputType::IST_Release, 0);
+
+	// Panel visibility: for games whose console is UWindow-based follow the game's own
+	// Viewport.bShowWindowsMouse - UWindowConsole raises it whenever a mouse-driven menu is
+	// showing and clears it when that menu closes BY ANY MEANS, including the player clicking
+	// "Return to game"/"Start" inside the menu. A plain Menu-button toggle can't see those
+	// in-menu closes and stayed stuck on (confirmed on real Quest 3 hardware via a screen
+	// recording: a black panel showing just the HUD hovering in front of the player during
+	// gameplay, and - because DrawEyeVR suppresses the per-eye overlays while the panel is
+	// up - no first-person weapon either, and no movement since the stick axes are zeroed
+	// below while the panel is up). Detected by the console CLASS, not the engine version:
+	// Unreal Gold 226b (ue1Version 226) already ships UWindow.u/UMenu.u and its
+	// UPak.UPakConsole derives from UWindowConsole, so the old ">= 400" gate left it on the
+	// manual toggle and reproduced exactly that stuck black panel on the Quest 3 (menu
+	// "moving with my head" from re-anchoring on every toggle press, black view, no movement).
+	// Games with a pre-UWindow console keep the manual toggle as the only option.
+	// UT names the class UWindowConsole; Unreal Gold 226's UWindow.u names it WindowConsole.
+	if (console && (console->IsA("UWindowConsole") || console->IsA("WindowConsole")))
+		vrBigScreenActive = viewport->bShowWindowsMouse();
+	else
+		vrBigScreenActive = vrBigScreenManualToggle;
+
+	if (!viewport->Actor() || timeElapsed <= 0.0f)
+		return;
+
+	UPlayerPawn* pawn = viewport->Actor();
+
+	// (Re)spawn: a new Pawn object arrives facing its PlayerStart. Adopt that yaw as the body
+	// yaw before the per-frame override below replaces it, otherwise the player always spawns
+	// facing whatever BodyYawRadians happened to be (initially world +X) - reported on real
+	// Quest 3 hardware as consistently spawning facing the wrong direction.
+	if (pawn != vrLastPawn)
+	{
+		vrLastPawn = pawn;
+		constexpr float twoPi = 2.0f * 3.14159265359f;
+		float spawnYaw = (float)(pawn->Rotation().Yaw & 0xFFFF) * (twoPi / 65536.0f);
+		vrInput->BodyYawRadians = spawnYaw;
+
+		// Deactivate double-tap dodging in VR: analog
+		// stick motion crossing the center reads as key double-taps and triggers hop-dodges.
+		pawn->SetFloat("DodgeClickTime", 0.0f);
+
+		// Deactivate walking view bob in VR: PlayerPawn.Bob drives the WalkBob offset PlayerCalcView adds to the camera -
+		// artificial vertical head motion, a classic VR comfort problem. The headset supplies
+		// real head motion instead.
+		pawn->SetFloat("Bob", 0.0f);
+	}
+
+	// While the big screen is showing, the right controller drives the menu cursor (see
+	// RunVRMenuScreen()) instead of movement/aim/fire - skip those entirely (and zero
+	// movement so the Pawn doesn't keep drifting from whatever axis values were last set before
+	// the menu opened).
+	if (vrBigScreenActive)
+	{
+		pawn->SetFloat("aBaseY", 0.0f);
+		pawn->SetFloat("aStrafe", 0.0f);
+		pawn->SetFloat("aUp", 0.0f);
+		// Fire/AltFire aren't zeroed here: they're driven by synthesized mouse-button
+		// press/release events below, and RunVRMenuScreen() sends the matching release
+		// (OnWindowMouseUp -> InputEvent IST_Release) if the trigger is let go while the menu
+		// is up, which clears the "Button bFire" binding the same way a real mouse would.
+		return;
+	}
+
+	// Body-facing yaw drives the Pawn's actual world rotation, not just the render camera's
+	// CameraRotation copy - without this the Pawn stays frozen at spawn orientation forever
+	// (VR bypasses the normal mouselook path that would otherwise turn it), so movement axes
+	// below would push relative to a rotation that never matches where the player is actually
+	// facing, and the Pawn would drift somewhere unintended (confirmed on real hardware: player
+	// ended up outside the map). Pitch/Roll are left alone - the body doesn't lean or tilt.
+	//
+	// ViewRotation must get the same yaw: UT's PlayerPawn.UpdateRotation() rebuilds Rotation
+	// from ViewRotation every tick (ViewRotation is what mouselook/aTurn normally drive, and
+	// nothing drives it in VR), so writing only Rotation() here was overwritten within the same
+	// tick and movement stayed locked to the spawn yaw no matter how many snap-turns were made
+	// (so movement follows snap-turns).
+	int bodyYawUnreal = (int)(vrInput->BodyYawRadians * (0x10000 / (2.0f * 3.14159265359f)));
+	Rotator bodyRotation = pawn->Rotation();
+	bodyRotation.Yaw = bodyYawUnreal;
+	pawn->Rotation() = bodyRotation;
+	Rotator viewRotation = pawn->ViewRotation();
+	viewRotation.Yaw = bodyYawUnreal;
+	// Redeemer guided missile: UT's GuidedWarShell steers itself from the player's
+	// ViewRotation every tick (and PlayerCalcView shows its camera, which the VR eyes follow
+	// automatically). Pinning ViewRotation to the body yaw at zero pitch made it fly dead
+	// straight - hand the full right-controller aim (yaw AND pitch) over while it's in flight.
+	if (pawn->ViewTarget() && pawn->ViewTarget()->IsA("GuidedWarShell") && vrInput->RightControllerActive)
+		viewRotation = vrInput->GetAimRotation();
+	pawn->ViewRotation() = viewRotation;
+
+	// Well above Pawn.AccelRate (2048 for UT players): UActor::ApplyMovementAcceleration
+	// (UActor_Phys.cpp) uses the axis-derived Acceleration vector as-is and only CLAMPS it down
+	// to AccelRate, so User.ini's nominal Speed=300 meant accelerating at 300 uu/s^2 - over a
+	// second to reach run speed, felt as "starting slow, I want to run directly" on real
+	// hardware. Anything >= AccelRate clamps to AccelRate, i.e. full acceleration at once; the
+	// direction comes from MoveAxis (already snapped to unit length in VRInput).
+	const float moveSpeed = 4096.0f;
+	pawn->SetFloat("aBaseY", vrInput->MoveAxisY * moveSpeed);
+	pawn->SetFloat("aStrafe", vrInput->MoveAxisX * moveSpeed);
+	pawn->SetFloat("aUp", vrInput->JumpPressed ? 300.0f : (vrInput->CrouchPressed ? -300.0f : 0.0f)); // swim/fly up, or down while crouching (Duck's "Axis aUp Speed=-300" half); a real jump is the exec function below
+
+	// UT jumps via the pawn's `exec function Jump()` (Space's binding), which sets bPressedJump
+	// for the next PlayerMove - the aUp axis alone only matters when swimming/flying.
+	if (vrInput->JumpJustPressed)
+		InputCommand("Jump", (EInputKey)0, 20);
+
+	// Fire/AltFire go through the SAME path a desktop mouse click takes - synthesized
+	// LeftMouse/RightMouse press+release events into InputEvent() - rather than poking the
+	// bFire/bAltFire properties directly. Setting the property only makes an already-armed
+	// weapon shoot; it never invokes the pawn's `exec function Fire()` that the LeftMouse
+	// keybinding's "Fire" alias ("Button bFire | Fire") calls, and in UT that exec function is
+	// also the "press fire to ready up / respawn" handler in the PlayerWaiting/Dying states.
+	// Confirmed on real Quest 3 hardware: trigger registered (TriggerRaw=1.0, Fire=1 in the
+	// diagnostics) yet "Waiting for ready signals" never cleared. InputEvent() also hands the
+	// key to the console's KeyEvent first, exactly like a real click, so the game's own UI
+	// still gets first refusal. Fallback: if User.ini has no LeftMouse/RightMouse binding,
+	// issue the stock UT alias command directly so the controls still work.
+	auto sendFireKey = [this](EInputKey key, EInputType type, const char* fallbackCommand)
+	{
+		InputEvent(key, type, 0);
+		if (type == EInputType::IST_Press && keybindings[keynames[key]].empty())
+			InputCommand(fallbackCommand, key, 20);
+	};
+
+	// Which mouse button carries AltFire. UT binds RightMouse=AltFire, but Unreal Gold's DefUser.ini
+	// has RightMouse=Jump and MiddleMouse=AltFire - so blindly synthesizing RightMouse for the grip
+	// made the player JUMP. Prefer a button whose binding names AltFire;
+	// otherwise an UNBOUND button, so sendFireKey's fallback command runs instead of whatever the
+	// game happens to have on that button.
+	auto bindingOf = [this](EInputKey key) -> std::string
+	{
+		auto it = keybindings.find(keynames[(int)key]);
+		std::string b = it != keybindings.end() ? it->second : std::string();
+		for (char& c : b) c = (char)std::tolower((unsigned char)c);
+		return b;
+	};
+	EInputKey altFireKey;
+	if (bindingOf(EInputKey::IK_RightMouse).find("altfire") != std::string::npos) altFireKey = EInputKey::IK_RightMouse;
+	else if (bindingOf(EInputKey::IK_MiddleMouse).find("altfire") != std::string::npos) altFireKey = EInputKey::IK_MiddleMouse;
+	else if (bindingOf(EInputKey::IK_MiddleMouse).empty()) altFireKey = EInputKey::IK_MiddleMouse;
+	else if (bindingOf(EInputKey::IK_RightMouse).empty()) altFireKey = EInputKey::IK_RightMouse;
+	else altFireKey = EInputKey::IK_MiddleMouse; // both bound to something else: least harmful guess
+	{
+		// The press runs the pawn's `exec function Fire()`, which calls Weapon.Fire() right here,
+		// synchronously - so the crosshair aim must already be in place (see VRAimOverrideScope).
+		VRAimOverrideScope aimOverride(this, vrInput->TriggerJustPressed || vrInput->GripJustPressed);
+		if (vrInput->TriggerJustPressed)
+			sendFireKey(EInputKey::IK_LeftMouse, EInputType::IST_Press, "Button bFire | Fire");
+		if (vrInput->GripJustPressed)
+			sendFireKey(altFireKey, EInputType::IST_Press, "Button bAltFire | AltFire");
+	}
+	if (vrInput->TriggerJustReleased)
+		sendFireKey(EInputKey::IK_LeftMouse, EInputType::IST_Release, nullptr);
+	if (vrInput->GripJustReleased)
+		sendFireKey(altFireKey, EInputType::IST_Release, nullptr);
+	if (vrInput->TriggerJustReleased || vrInput->GripJustReleased)
+		vrAimOverrideAfterRelease = 0.35f; // see Engine.h - release-fired weapons (rocket launcher)
+	else if (vrAimOverrideAfterRelease > 0.0f)
+		vrAimOverrideAfterRelease -= timeElapsed;
+
+	// Right stick up/down: the pawn's NextWeapon/PrevWeapon exec functions (what the mouse
+	// wheel is bound to on desktop).
+	if (vrInput->WeaponNextJustPressed)
+		InputCommand("NextWeapon", (EInputKey)0, 20);
+	else if (vrInput->WeaponPrevJustPressed)
+		InputCommand("PrevWeapon", (EInputKey)0, 20);
+
+	// Left Y: scoreboard toggle (desktop F1 - the pawn's ShowScores exec function).
+	if (vrInput->ScoresJustPressed)
+		InputCommand("ShowScores", (EInputKey)0, 20);
+
+	// Right B: F2, as a real key tap so whatever the game binds to F2 runs (Unreal Gold's DefUser.ini:
+	// "ActivateTranslator | FunctionKey 2" - the universal translator).
+	if (vrInput->TranslatorJustPressed)
+	{
+		InputEvent(EInputKey::IK_F2, EInputType::IST_Press, 0);
+		InputEvent(EInputKey::IK_F2, EInputType::IST_Release, 0);
+	}
+
+	// Right A: Enter, as a real key tap - Unreal binds it to "InventoryActivate" (ActivateItem,
+	// e.g. the selected inventory item such as the flashlight).
+	if (vrInput->ActivateItemJustPressed)
+	{
+		InputEvent(EInputKey::IK_Enter, EInputType::IST_Press, 0);
+		InputEvent(EInputKey::IK_Enter, EInputType::IST_Release, 0);
+	}
+
+	// Left X: RightBracket ("]"), as a real key tap - Unreal binds it to "InventoryNext" (select the next
+	// inventory item).
+	if (vrInput->NextItemJustPressed)
+	{
+		InputEvent(EInputKey::IK_RightBracket, EInputType::IST_Press, 0);
+		InputEvent(EInputKey::IK_RightBracket, EInputType::IST_Release, 0);
+	}
+}
+
+// Raw OpenXR-space forward direction (local -Z rotated by the quaternion) - NOT run through
+// VRCamera's OpenXRToUnrealDirection/body-yaw remap, unlike VRInput::GetAimForwardWorld().
+// RunVRMenuScreen() below needs this because it positions and ray-casts against the screen
+// quad entirely in OpenXR/STAGE space (meters, matching GetHeadPose()/RightControllerPosition
+// directly) rather than converting everything into UE1 world space - simpler and one fewer
+// axis-convention risk than the menu's first (reverted) implementation, which tried to invert
+// the 2D Canvas overlay's own screen-space projection instead of using a real world anchor.
+static vec3 GetOpenXRForwardRaw(float qx, float qy, float qz, float qw)
+{
+	mat4 m = mat4::quaternion(qx, qy, qz, qw);
+	return vec3(-m[2 * 4 + 0], -m[2 * 4 + 1], -m[2 * 4 + 2]); // -column2 = local -Z (forward)
+}
+
+static constexpr float VRUnitsPerMeter = VRCamera::UnitsPerMeter;
+
+// "Big screen" menu (Engine::RunVR()'s VR branch, once per app-frame) - matches Team Beef
+// Studios' QuakeQuest's bigScreen/VR_UseScreenLayer() mode (TBXR_Common.c/QuakeQuest_OpenXR.c)
+// in spirit: a flat panel a fixed distance in front of wherever the player was looking when
+// the menu opened. Renders the 2D menu/UI into an engine-owned texture
+// (RenderSubsystem::RenderMenuTexture()) and then hands the per-eye render loop a world-space
+// quad to draw with it (RenderSubsystem::SetMenuWorldQuad() -> DrawEyeVR()), so the panel is
+// rendered by the exact same camera transform as the level geometry.
+//
+// This deliberately does NOT use an OpenXR XrCompositionLayerQuad the way QuakeQuest does (the
+// first implementation did - see RenderDevice.h's UnlockScreen comment): on real Quest 3
+// hardware that layer stayed glued directly in front of the player's face however they turned,
+// despite diagnostic logging confirming the submitted STAGE-space pose was byte-identical for
+// 20+ seconds. Rendering the quad ourselves removes the compositor from the equation entirely.
+//
+// The pose is computed ONCE (on the closed->open transition, via vrMenuScreenPositioned -
+// reset when the menu closes) rather than every frame from the live head position, unlike
+// QuakeQuest's own literal formula (which keys position off gAppState.xfStageFromHead.position
+// freshly each frame, only freezing the YAW/facing direction via its own playerYaw latch).
+// Confirmed on real Quest 3 hardware: continuous repositioning made the panel feel head-locked
+// and following the head rather than a fixed screen - locking it once on open, as a real
+// static object placed in the room, is what was actually wanted.
+//
+// All positioning and the cursor's ray-vs-plane intersection happen in OpenXR/STAGE space
+// (meters, matching GetHeadPose()/RightControllerPosition directly - see GetOpenXRForwardRaw()
+// above); only the final four corners are converted to UE1 world space for rendering, via the
+// same anchor/scale/body-yaw chain the eye cameras use (VRCamera::StageToWorldPosition), so
+// the quad and the camera agree on where "the room" is.
+void Engine::RunVRMenuScreen()
+{
+	if (!vrInput || !vrBigScreenActive)
+	{
+		render->SetMenuWorldStrips(false, nullptr, 0);
+		vrMenuScreenPositioned = false; // re-anchor fresh next time the menu opens
+		return;
+	}
+
+	Widget* vrWindow = window.get();
+
+	const float screenDistanceMeters = 2.5f; // a comfortable reading distance
+	// Cinema-sized (~72 x 57 degrees at 2.5m): the panel is rendered 1:1 at eye resolution
+	// (ResetCanvas keeps uiscale 1 for it), so UT's small bitmap fonts get their legibility from
+	// physical size rather than pixel-doubling - see the RenderingMenuTexture comment there.
+	const float screenWidthMeters = 3.6f;
+	const float screenHeightMeters = 2.7f; // 4:3, matching the canvas sub-rectangle below
+
+	if (!vrMenuScreenPositioned)
+	{
+		// Horizontal component of where the HEAD is physically looking right now, in STAGE
+		// space - NOT BodyYawRadians: that's a game-world yaw (snap-turn accumulator) that has
+		// no meaning in the physical room's coordinate frame, and using it here put the panel
+		// in a fixed room direction regardless of which way the player actually faced.
+		MotionControllerPose headPose = vrWindow->GetHeadPose();
+		vec3 headForward = GetOpenXRForwardRaw(headPose.OrientationX, headPose.OrientationY, headPose.OrientationZ, headPose.OrientationW);
+		vec3 forward(headForward.x, 0.0f, headForward.z);
+		float len = std::sqrt(forward.x * forward.x + forward.z * forward.z);
+		forward = len > 0.001f ? forward / len : vec3(0.0f, 0.0f, -1.0f); // looking straight up/down: fall back to STAGE forward
+
+		vrMenuScreenForward = forward;
+		vrMenuScreenPos = vec3(headPose.PositionX, headPose.PositionY, headPose.PositionZ) + forward * screenDistanceMeters;
+		vrMenuScreenPositioned = true;
+	}
+
+	// Panel basis in STAGE space, as seen BY THE PLAYER: right = forward x up (right-handed,
+	// +Y up), up = +Y, normal points back at the player. Image (0,0) is the top-left corner
+	// from the player's viewpoint - see VulkanRenderDevice::DrawMenuWorldQuad's UV assignment.
+	vec3 quadPos = vrMenuScreenPos;
+	vec3 quadForward = vrMenuScreenForward;
+	vec3 quadUp(0.0f, 1.0f, 0.0f);
+	vec3 quadRight(-quadForward.z, 0.0f, quadForward.x);
+	vec3 quadNormal = -quadForward;
+
+	// Render the menu texture. It's sized to match the EYE render target rather than a
+	// separate UI resolution, so VulkanRenderDevice::Lock() doesn't tear down and rebuild the
+	// shared offscreen Scene buffers (and every pipeline with them) three times per frame
+	// because the size keeps alternating - the previous screen-layer path paid exactly that
+	// cost. The 2D canvas only covers a 4:3 sub-rectangle at the top-left of it, and the quad's
+	// UVs are clipped to match (uvMax).
+	int eyeWidth, eyeHeight;
+	vrWindow->GetEyeImageSize(0, &eyeWidth, &eyeHeight);
+	int canvasWidth = eyeWidth;
+	int canvasHeight = std::min(eyeHeight, eyeWidth * 3 / 4);
+	viewport->SetViewportRect(0, 0, canvasWidth, canvasHeight);
+	render->RenderMenuTexture(eyeWidth, eyeHeight);
+	vec2 uvMax((float)canvasWidth / (float)eyeWidth, (float)canvasHeight / (float)eyeHeight);
+
+	// Curved screen: a vertical cylinder segment of radius screenDistanceMeters centered on
+	// where the head was when the menu opened (so every point of the panel is the same
+	// distance from the viewer - a slightly curved screen). Arc length
+	// = screenWidthMeters, so the angular span is width / radius (~82 degrees at 3.6m / 2.5m).
+	// Built as a fan of flat strips, each showing its slice of the texture.
+	const int stripCount = 16;
+	const float radius = screenDistanceMeters;
+	const float totalAngle = screenWidthMeters / radius;
+	const float halfH = screenHeightMeters * 0.5f;
+	vec3 cylinderCenter = quadPos - quadForward * radius; // head position at open time
+	auto pointOnCylinder = [&](float angle, float y) -> vec3
+	{
+		// angle 0 = straight ahead, positive = towards quadRight
+		vec3 dir = quadForward * std::cos(angle) + quadRight * std::sin(angle);
+		return cylinderCenter + dir * radius + quadUp * y;
+	};
+	RenderSubsystem::MenuStrip strips[stripCount];
+	for (int i = 0; i < stripCount; i++)
+	{
+		float a0 = -totalAngle * 0.5f + totalAngle * (float)i / stripCount;
+		float a1 = -totalAngle * 0.5f + totalAngle * (float)(i + 1) / stripCount;
+		vec3 stageCorners[4] = {
+			pointOnCylinder(a0, +halfH), // top-left
+			pointOnCylinder(a1, +halfH), // top-right
+			pointOnCylinder(a1, -halfH), // bottom-right
+			pointOnCylinder(a0, -halfH), // bottom-left
+		};
+		for (int c = 0; c < 4; c++)
+			strips[i].Corners[c] = VRCamera::StageToWorldPosition(stageCorners[c], CameraLocation, vrInput->BodyYawRadians, VRUnitsPerMeter, vrInput->HeadAnchorPosition);
+		strips[i].UVMin = vec2(uvMax.x * (float)i / stripCount, 0.0f);
+		strips[i].UVMax = vec2(uvMax.x * (float)(i + 1) / stripCount, uvMax.y);
+	}
+	render->SetMenuWorldStrips(true, strips, stripCount);
+
+	// Cursor: intersect the controller ray with that cylinder (infinite height, vertical axis
+	// through cylinderCenter), then map the hit's angle/height to canvas pixels.
+	vec3 rayOrigin = vrInput->RightControllerPosition; // already raw OpenXR/STAGE space, no UE1 remap
+	vec3 rayDir = GetOpenXRForwardRaw(vrInput->RightControllerOrientation[0], vrInput->RightControllerOrientation[1], vrInput->RightControllerOrientation[2], vrInput->RightControllerOrientation[3]);
+
+	vec3 rel = rayOrigin - cylinderCenter;
+	float a = rayDir.x * rayDir.x + rayDir.z * rayDir.z;
+	float b = 2.0f * (rel.x * rayDir.x + rel.z * rayDir.z);
+	float c = rel.x * rel.x + rel.z * rel.z - radius * radius;
+	if (a < 0.000001f)
+		return; // aiming straight up/down - no sensible hit point
+	float disc = b * b - 4.0f * a * c;
+	if (disc < 0.0f)
+		return;
+	float sq = std::sqrt(disc);
+	float t = (-b + sq) / (2.0f * a); // the far root: from inside the cylinder this is the wall in front of the ray
+	if (t <= 0.0f)
+		return;
+
+	vec3 hitPoint = rayOrigin + rayDir * t;
+	vec3 hitRel = hitPoint - cylinderCenter;
+	float hitAngle = std::atan2(dot(hitRel, quadRight), dot(hitRel, quadForward)); // 0 = straight ahead, + = right
+	float localY = dot(hitRel, quadUp);
+
+#ifdef ANDROID
+	static int menuCursorDiagCounter = 0;
+	if ((++menuCursorDiagCounter % 30) == 0)
+		__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag", "MenuCursor: t=%.3f angle=%.3f (span %.3f) localY=%.3f (halfH %.2f) rightActive=%d", t, hitAngle, totalAngle, localY, halfH, vrInput->RightControllerActive ? 1 : 0);
+#endif
+
+	// Outside the physical panel - don't clamp onto an edge (would make the cursor stick to a
+	// border whenever aiming away), just leave the cursor wherever it last was.
+	if (std::fabs(hitAngle) > totalAngle * 0.5f || std::fabs(localY) > halfH)
+		return;
+
+	Point cursorPos;
+	// UWindow works in the logical canvas (texture pixels / MenuUIScale), so feed it those units.
+	const int menuUIScale = render->MenuUIScale();
+	cursorPos.x = (hitAngle / totalAngle + 0.5) * canvasWidth / menuUIScale;
+	cursorPos.y = (0.5 - localY / screenHeightMeters) * canvasHeight / menuUIScale; // screen Y grows downward, quadUp grows upward
+
+	OnWindowMouseMove(cursorPos);
+
+	if (vrInput->TriggerJustPressed)
+		OnWindowMouseDown(cursorPos, EInputKey::IK_LeftMouse);
+	else if (vrInput->TriggerJustReleased)
+		OnWindowMouseUp(cursorPos, EInputKey::IK_LeftMouse);
+}
+
+// VR sniper scope. UT's zoom only shrinks PlayerPawn.FovAngle, which the OpenXR eye projection
+// ignores - so instead, while the game reports a zoomed FOV, render the world from the gun's
+// viewpoint with that FOV into the shared menu texture (RenderSubsystem::RenderScopeTexture)
+// and show it on a small screen fixed to the right controller, just above and ahead of the
+// barrel: aiming is done by moving the hand, exactly like the crosshair. Yields to the menu
+// panel (same texture) and switches off when the FOV goes back to normal.
+void Engine::RunVRScope()
+{
+	UPlayerPawn* pawn = viewport->Actor();
+	const float defaultFov = pawn && pawn->HasProperty("DefaultFOV") ? pawn->GetFloat("DefaultFOV") : 90.0f;
+	bool zoomed = pawn && CameraFovAngle < defaultFov - 1.0f;
+	if (!vrInput || !zoomed || vrBigScreenActive || !vrInput->RightControllerActive || !Level)
+	{
+		render->SetScopeWorldQuad(false, nullptr, vec2(1.0f));
+		return;
+	}
+
+	Widget* vrWindow = window.get();
+
+	// Controller basis in STAGE space (mat4::quaternion columns: 0 = right, 1 = up, 2 = back).
+	const float* q = vrInput->RightControllerOrientation;
+	mat4 m = mat4::quaternion(q[0], q[1], q[2], q[3]);
+	vec3 right(m[0 * 4 + 0], m[0 * 4 + 1], m[0 * 4 + 2]);
+	vec3 up(m[1 * 4 + 0], m[1 * 4 + 1], m[1 * 4 + 2]);
+	vec3 forward = GetOpenXRForwardRaw(q[0], q[1], q[2], q[3]);
+	vec3 hand = vrInput->RightControllerPosition;
+
+	// Scope camera: a little ahead of the hand along the barrel, looking where the gun points,
+	// with the game's zoomed FOV on a square image.
+	vec3 cameraLocation = VRCamera::StageToWorldPosition(hand + forward * 0.15f, CameraLocation, vrInput->BodyYawRadians, VRUnitsPerMeter, vrInput->HeadAnchorPosition);
+	Coords cameraRotation = VRCamera::GetEyeWorldRotation(q[0], q[1], q[2], q[3], vrInput->BodyYawRadians);
+	mat4 worldToView = Coords::ViewToRenderDev().ToMatrix() * cameraRotation.Inverse().ToMatrix() * Coords::Location(cameraLocation).ToMatrix();
+	// Half the game's zoomed FOV = twice its magnification ("the zoom should be stronger" on
+	// real hardware - a flat-screen zoom level reads weaker on a small floating scope screen).
+	float scopeFov = std::max(CameraFovAngle * 0.5f, 4.0f);
+	float rprojz = (float)std::tan(radians(scopeFov) * 0.5f);
+	mat4 projection = mat4::frustum(-rprojz, rprojz, -rprojz, rprojz, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+
+	// Square render region at the texture's top-left (the texture itself stays eye-sized so
+	// the scene buffers aren't rebuilt - see RunVRMenuScreen's comment).
+	int eyeWidth, eyeHeight;
+	vrWindow->GetEyeImageSize(0, &eyeWidth, &eyeHeight);
+	int scopeSize = std::min(std::min(eyeWidth, eyeHeight), 900);
+	viewport->SetViewportRect(0, 0, scopeSize, scopeSize);
+	render->RenderScopeTexture(eyeWidth, eyeHeight, worldToView, projection, cameraLocation, cameraRotation);
+	vec2 uvMax((float)scopeSize / (float)eyeWidth, (float)scopeSize / (float)eyeHeight);
+
+	// Scope screen: 32cm square (doubled from 16cm on real-hardware feedback), 30cm ahead of
+	// the hand and 8cm above the barrel, facing back along the barrel so it's seen square-on
+	// when sighting down the gun.
+	const float screenHalf = 0.16f;
+	vec3 center = hand + forward * 0.30f + up * 0.08f;
+	vec3 stageCorners[4] = {
+		center - right * screenHalf + up * screenHalf, // top-left (as seen from behind the gun)
+		center + right * screenHalf + up * screenHalf, // top-right
+		center + right * screenHalf - up * screenHalf, // bottom-right
+		center - right * screenHalf - up * screenHalf, // bottom-left
+	};
+	vec3 worldCorners[4];
+	for (int i = 0; i < 4; i++)
+		worldCorners[i] = VRCamera::StageToWorldPosition(stageCorners[i], CameraLocation, vrInput->BodyYawRadians, VRUnitsPerMeter, vrInput->HeadAnchorPosition);
+	render->SetScopeWorldQuad(true, worldCorners, uvMax);
+}
+
 void Engine::UpdateInput(float timeElapsed)
 {
 	if (timeElapsed <= 0.0f)
@@ -1568,6 +2201,163 @@ void Engine::OpenWindow()
 void Engine::CloseWindow()
 {
 	window.reset();
+}
+
+// Per-eye VR frame loop, called from Run() in place of a single render->DrawGame(levelElapsed)
+// call once vrInput exists (i.e. window->GetRenderDevice()->Viewport->IsStereoDisplay()).
+// Everything preceding this in Run()'s loop body (tick, PlayerCalcView, head-yaw override) has
+// already happened for this frame; this function only drives OpenXR's frame lifecycle and
+// renders/presents both eyes.
+void Engine::RunVR(float levelTimeElapsed)
+{
+	Widget* vrWindow = window.get();
+
+	if (!vrWindow->WaitFrame())
+	{
+		// Nothing to render this iteration - either the session isn't running yet/anymore
+		// (headset off head, app backgrounded), or it is but this particular frame shouldn't
+		// render. EndFrame() is safe to call unconditionally either way: it no-ops if no
+		// matching xrBeginFrame happened, and otherwise submits a zero-layer frame so the
+		// compositor's frame-timing stays in sync (see OpenXRDisplayWindow::EndFrame).
+		vrWindow->EndFrame();
+		return;
+	}
+
+	const float uuPerMeter = VRUnitsPerMeter;
+
+	// Raise the VR head above the script camera (see VRCamera::HeadHeightOffsetMeters). Done here,
+	// after this frame's PlayerCalcView/UpdateAudio and before anything VR reads CameraLocation.
+	CameraLocation.z += VRCamera::HeadHeightOffsetMeters * uuPerMeter;
+
+	// eyeSeparationScale=1.0 (unreduced) matches Team Beef Studios' QuakeQuest's own approach
+	// (Projects/Android/jni/darkplaces/gl_rmain.c: GetStereoSeparation() = vr_worldscale.value
+	// * VR_GetIPD()) - one unified world scale applied directly to the real measured IPD, no
+	// separate reduction factor. An artificially reduced value (tried at 0.5, then 0.3) didn't
+	// fix a "the two eyes feel too different" report even near-zero - see headPose below for
+	// what actually was the cause.
+	const float eyeSeparationScale = 1.0f;
+	vec3 headCenterPositionMeters = vec3(vrInput->HeadView.PositionX, vrInput->HeadView.PositionY, vrInput->HeadView.PositionZ);
+
+	// The SHARED head orientation (see VRCamera.h's BuildWorldToView comment and Widget::
+	// GetHeadPose()'s comment) - queried once per app-frame here and used for BOTH eyes'
+	// rotation below, rather than each eye's own individually-reported orientation. This -
+	// not eye separation distance - turned out to be the actual cause of a real-hardware
+	// "the two eyes feel too different" report.
+	MotionControllerPose headPose = vrWindow->GetHeadPose();
+
+	render->BeginVRFrame(levelTimeElapsed);
+
+	// "Big screen" menu - see RunVRMenuScreen()'s comment. Renders the menu texture and arms
+	// (or disarms) the per-eye world quad draw below, so it must run before the eye loop.
+	RunVRMenuScreen();
+
+	// Sniper scope (shares the menu texture, so it runs after and yields to the menu).
+	RunVRScope();
+
+#ifdef ANDROID
+	// Throttled once-per-~2s diagnostic dump of the actual computed VR camera/input values -
+	// added to debug "camera outside the map"/"stereo distorted"/"no controller input"
+	// reports from real-device testing that aren't reproducible from a screenshot (OpenXR
+	// swapchain content doesn't appear in adb screencap, which only captures the flat 2D
+	// compositor surface). Remove once those are confirmed fixed.
+	static int vrDiagFrameCounter = 0;
+	bool vrDiagLogThisFrame = (++vrDiagFrameCounter % 30) == 0; // was 120 - shortened while debugging trigger input so a quick press is more likely to land on a logged sample
+	if (vrDiagLogThisFrame)
+	{
+		vec3 headFwd = VRCamera::GetEyeWorldRotation(headPose.OrientationX, headPose.OrientationY, headPose.OrientationZ, headPose.OrientationW, vrInput->BodyYawRadians).XAxis;
+		vec3 aimFwd = vrInput->GetAimForwardWorld();
+		Rotator pawnRot = viewport->Actor() ? viewport->Actor()->Rotation() : Rotator(0, 0, 0);
+		__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag",
+			"CameraLocation=(%.1f,%.1f,%.1f) BodyYaw=%.2f headFwd=(%.2f,%.2f,%.2f) aimFwd=(%.2f,%.2f,%.2f) pawnYaw=%d MoveAxis=(%.2f,%.2f) Fire=%d RightCtrlActive=%d TriggerRaw=%.3f"
+			" | BigScreen=%d WinMouse=%d NoDrawWorld=%d MenuPositioned=%d MenuPos=(%.2f,%.2f,%.2f) Anchor=(%.2f,%.2f,%.2f) HeadPos=(%.2f,%.2f,%.2f) levelDt=%.4f",
+			CameraLocation.x, CameraLocation.y, CameraLocation.z,
+			vrInput->BodyYawRadians,
+			headFwd.x, headFwd.y, headFwd.z, aimFwd.x, aimFwd.y, aimFwd.z, pawnRot.Yaw,
+			vrInput->MoveAxisX, vrInput->MoveAxisY, vrInput->FirePressed ? 1 : 0, vrInput->RightControllerActive ? 1 : 0,
+			vrInput->RightTriggerValueRaw,
+			vrBigScreenActive ? 1 : 0, viewport->bShowWindowsMouse() ? 1 : 0, (console && console->bNoDrawWorld()) ? 1 : 0, vrMenuScreenPositioned ? 1 : 0,
+			vrMenuScreenPos.x, vrMenuScreenPos.y, vrMenuScreenPos.z,
+			vrInput->HeadAnchorPosition.x, vrInput->HeadAnchorPosition.y, vrInput->HeadAnchorPosition.z,
+			headPose.PositionX, headPose.PositionY, headPose.PositionZ, levelTimeElapsed);
+	}
+#endif
+
+#ifdef ANDROID
+	auto vrFrameRenderStart = std::chrono::steady_clock::now();
+#endif
+
+	for (int eye = 0; eye < 2; eye++)
+	{
+		StereoEyeView eyeView = vrWindow->GetEyeView(eye);
+
+		mat4 worldToView = VRCamera::BuildWorldToView(eyeView, CameraLocation, vrInput->BodyYawRadians, uuPerMeter, vrInput->HeadAnchorPosition, headCenterPositionMeters, eyeSeparationScale,
+			headPose.OrientationX, headPose.OrientationY, headPose.OrientationZ, headPose.OrientationW);
+		mat4 projection = VRCamera::BuildProjection(eyeView, 1.0f, 32768.0f);
+		vec3 eyeLocation = VRCamera::GetEyeWorldLocation(eyeView, CameraLocation, vrInput->BodyYawRadians, uuPerMeter, vrInput->HeadAnchorPosition, headCenterPositionMeters, eyeSeparationScale);
+		Coords eyeRotation = VRCamera::GetEyeWorldRotation(headPose.OrientationX, headPose.OrientationY, headPose.OrientationZ, headPose.OrientationW, vrInput->BodyYawRadians);
+
+#ifdef ANDROID
+		// Diagnostic for the "menu panel follows my head" report: the panel centre in THIS eye's
+		// view space. World-fixed => moves as the head turns; head-locked => constant.
+		if (vrDiagLogThisFrame && eye == 0 && vrBigScreenActive && vrMenuScreenPositioned)
+		{
+			vec3 panelCenterWorld = VRCamera::StageToWorldPosition(vrMenuScreenPos, CameraLocation, vrInput->BodyYawRadians, uuPerMeter, vrInput->HeadAnchorPosition);
+			vec4 pv = worldToView * vec4(panelCenterWorld, 1.0f);
+			__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag", "PanelView eye0=(%.1f,%.1f,%.1f) panelWorld=(%.1f,%.1f,%.1f) eyeWorld=(%.1f,%.1f,%.1f)",
+				pv.x, pv.y, pv.z, panelCenterWorld.x, panelCenterWorld.y, panelCenterWorld.z, eyeLocation.x, eyeLocation.y, eyeLocation.z);
+		}
+#endif
+
+		render->SetVREyeOverride(eye, worldToView, projection, eyeLocation, eyeRotation);
+
+		int width, height;
+		vrWindow->GetEyeImageSize(eye, &width, &height);
+		viewport->SetViewportRect(0, 0, width, height);
+
+#ifdef ANDROID
+		if (vrDiagLogThisFrame)
+		{
+			__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag",
+				"eye=%d size=%dx%d rawEyePos=(%.3f,%.3f,%.3f) eyeQuat=(%.3f,%.3f,%.3f,%.3f) fov(L,R,U,D)=(%.3f,%.3f,%.3f,%.3f) eyeWorldLoc=(%.1f,%.1f,%.1f)",
+				eye, width, height,
+				eyeView.PositionX, eyeView.PositionY, eyeView.PositionZ,
+				eyeView.OrientationX, eyeView.OrientationY, eyeView.OrientationZ, eyeView.OrientationW,
+				eyeView.FovAngleLeft, eyeView.FovAngleRight, eyeView.FovAngleUp, eyeView.FovAngleDown,
+				eyeLocation.x, eyeLocation.y, eyeLocation.z);
+		}
+#endif
+
+		// Unswapped (eye N's camera data goes to swapchain N directly). Flip-flopped multiple
+		// times based on direct real-hardware reports (wrong eye -> swap -> too different ->
+		// revert -> inverted again -> swap -> still not correct -> revert, this time explicitly
+		// confirmed wrong). Eye indexing itself is consistent everywhere in this loop and in
+		// OpenXRDisplayWindow (GetEyeView/AcquireEyeImage/etc. all keyed by the same `eye`), and
+		// the runtime's own per-eye FOV asymmetry data matches "index 0 = left" per the OpenXR
+		// spec - given the swap has now been tried and rejected twice, whatever's causing a
+		// perceived left/right issue likely isn't a simple index swap; don't re-try this without
+		// new evidence pointing specifically at it.
+		int outputEye = eye;
+		int imageIndex = vrWindow->AcquireEyeImage(outputEye);
+		VkImage eyeImage = vrWindow->GetEyeImage(outputEye, imageIndex);
+		render->DrawEyeVR(outputEye, imageIndex, eyeImage, width, height);
+		vrWindow->ReleaseEyeImage(outputEye);
+	}
+
+	render->EndVRFrame();
+	vrWindow->EndFrame();
+
+#ifdef ANDROID
+	// TEMP diagnostic - see the render-resolution-scale comment in openxr_display_window.cpp's
+	// EnumerateViews(). Logs how long the two-eye render+present actually takes so a doubling/
+	// ghosting report can be correlated against real frame time instead of guessed at - Quest
+	// needs a full app-frame (both eyes) done well under ~11ms (72Hz) / ~13.9ms (90Hz) to avoid
+	// the compositor's own reprojection kicking in and visibly smearing/doubling the image.
+	if (vrDiagLogThisFrame)
+	{
+		double frameMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vrFrameRenderStart).count();
+		__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag", "Eye render+present took %.2f ms this frame", frameMs);
+	}
+#endif
 }
 
 void Engine::TickWindow()

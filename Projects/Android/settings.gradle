@@ -1,0 +1,2 @@
+// Also the APK base name: build/outputs/apk/<variant>/UnrealGoldVR-<variant>.apk
+rootProject.name = 'UnrealGoldVR'

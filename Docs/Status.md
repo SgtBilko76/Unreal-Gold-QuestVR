@@ -75,7 +75,7 @@ they end up dying because SE thinks that they've fallen from a great height.
 
 436 version of the game launches. Menu options will work and botmatches can be played. Bots will behave more or less like they do in Unreal and some maps might have some functionality missing.
 
-469c version of the game also launches. So far the touch events doesn't work.
+469c version of the game also launches. Touch events (pickups, triggers, teleporters) work since the dynamic-array property accessor fix (469 made `Actor.Touching` a dynamic array).
 
 Anything beyond 469c currently won't boot.
 

@@ -14,6 +14,7 @@
 #include <surrealwidgets/core/theme.h>
 #include <surrealwidgets/window/window.h>
 #include <iostream>
+#include <fstream>
 
 int GameApp::main(Array<std::string> args)
 {
@@ -32,11 +33,39 @@ int GameApp::main(Array<std::string> args)
 
 		if (commandline->HasArg("-h", "--help"))
 		{
-			std::cout << "SurrealEngine [--url=<mapname>] [--engineversion=X] [Path to game folder]\n";
+			std::cout << "SurrealEngine [--url=<mapname>] [--engineversion=X] [--play] [--logfile=<path>] [Path to game folder]\n";
+			std::cout << "  --play           skip the launcher and start the first detected game (use with a game folder path)\n";
+			std::cout << "  --logfile=<path> stream the engine log to a plain text file\n";
 			return 0;
 		}
 
-		int selectedGameIndex = LauncherWindow::ExecModal();
+		// --logfile: stream every log line to disk as it is produced, so a hard crash still leaves a usable log.
+		std::ofstream logFile;
+		std::string logFileName = commandline->GetArg("-l", "--logfile");
+		if (!logFileName.empty())
+		{
+			logFile.open(logFileName, std::ios::out | std::ios::trunc);
+			Logger::Get()->SetCallback([&logFile](const LogMessageLine& line)
+			{
+				if (!line.Source.empty())
+					logFile << "[" << line.Source << "] ";
+				logFile << line.Text << std::endl;
+			});
+		}
+
+		int selectedGameIndex = -1;
+		if (commandline->HasArg("-p", "--play"))
+		{
+			// Unattended launch (mirrors MainAndroid): use the folder(s) from the command line, no launcher window.
+			GameFolderSelection::UpdateList();
+			if (GameFolderSelection::Games.empty())
+				throw std::runtime_error("--play: no supported UE1 game found in the given folder");
+			selectedGameIndex = 0;
+		}
+		else
+		{
+			selectedGameIndex = LauncherWindow::ExecModal();
+		}
 		if (selectedGameIndex >= 0)
 		{
 			GameLaunchInfo info = GameFolderSelection::GetLaunchInfo(selectedGameIndex);

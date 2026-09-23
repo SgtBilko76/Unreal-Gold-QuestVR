@@ -7,3 +7,23 @@
 /.cppbuild
 /*.sln
 .DS_Store
+
+# Android / Gradle
+/Projects/Android/local.properties
+/Projects/Android/.gradle
+/Projects/Android/.cxx
+/Projects/Android/build
+/Projects/Android/.idea
+/Projects/Android/*.iml
+/Projects/Android/android.debug.keystore
+
+# Android beta: staged game data + pk3 for APK assets (copied from the local game install, never committed)
+Projects/Android/assets-game/
+/Projects/Android/assets-game-ut-game-backup
+/Projects/Android/*.apk
+
+# Reference copy of Team Beef QuakeQuest (consulted for the OpenXR port, not built)
+/QuakeQuest-master/
+# Gradle/JVM heap dumps
+/Projects/Android/*.hprof
+/Projects/Android/assets-game-*/

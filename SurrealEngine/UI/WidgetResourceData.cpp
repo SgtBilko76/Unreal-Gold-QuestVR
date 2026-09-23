@@ -14,7 +14,23 @@ public:
 	{
 		const auto pk3PathStr = (fs::path{ OS::executable_path() } / "SurrealEngine.pk3").string();
 		mz_bool result = mz_zip_reader_init_file(&widgetResources, pk3PathStr.c_str(), 0);
-#ifndef WIN32
+#ifdef ANDROID
+		// OS::executable_path() (Utils/File.cpp) resolves via /proc/self/exe, which for a
+		// shared library loaded into an Android app process points at app_process/zygote, not
+		// anywhere useful - so the above always misses on this platform. SurrealEngineActivity
+		// sideloads game content to SURREALENGINE_DIR (see MainAndroid.cpp), and the natural
+		// place for the user to also drop SurrealEngine.pk3 is right alongside it, since both
+		// are "extra files this app needs that can't ship in the APK" from the user's
+		// perspective (game content for licensing reasons, this pk3 because the desktop build
+		// doesn't currently package/install it for any platform - see root CMakeLists.txt's
+		// ANDROID branch note next to the per-platform .pk3 install commands).
+		if (!result)
+		{
+			const char* gameDir = std::getenv("SURREALENGINE_DIR");
+			if (gameDir)
+				result = mz_zip_reader_init_file(&widgetResources, (fs::path(gameDir) / "SurrealEngine.pk3").c_str(), 0);
+		}
+#elif !defined(WIN32)
 		// On Linux, SurrealEngine.pk3 can additionally be put in some other folders given below.
 		if (!result)
 			result = mz_zip_reader_init_file(&widgetResources, "/usr/share/surrealengine/SurrealEngine.pk3", 0);

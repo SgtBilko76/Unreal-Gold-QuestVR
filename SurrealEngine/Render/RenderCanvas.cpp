@@ -1,5 +1,11 @@
 
 #include "Precomp.h"
+#include "Packages/Engine/Resources/Mesh/UMesh.h"
+#include <map>
+#include <algorithm>
+#include <set>
+#include "Package/PackageManager.h"
+#include "Utils/Logger.h"
 #include "RenderSubsystem.h"
 #include "VisibleMesh.h"
 #include "RenderDevice/RenderDevice.h"
@@ -14,6 +20,8 @@
 #include "GameWindow.h"
 #include "VM/ScriptCall.h"
 #include "Engine.h"
+#include "VR/VRInput.h"
+#include "VR/VRCamera.h"
 
 void RenderSubsystem::ResetCanvas()
 {
@@ -21,6 +29,19 @@ void RenderSubsystem::ResetCanvas()
 	// Assume 1280x960 for UT and newer.
 	int vertResolution = engine->LaunchInfo.ue1Version < 400 ? 768 : 960;
 	Canvas.uiscale = std::max((engine->viewport->ViewportHeight() + vertResolution / 2) / vertResolution, 1);
+	if (RenderingMenuTexture)
+	{
+		// The VR menu panel: always uiscale 1. Pixel-doubling (a 540-line logical canvas) was
+		// tried for readability and rejected on real Quest 3 hardware for being far too
+		// low resolution - the panel only covers ~780 eye pixels across, so 720 logical pixels look like
+		// a 640x480 desktop. Legibility comes from the panel's physical size instead
+		// (Engine::RunVRMenuScreen's screenWidth/HeightMeters), keeping 1 logical pixel = 1
+		// texture pixel, sharper than the eye display itself can resolve.
+		// Unreal (Gold) is the exception: its older UWindow/UMenu does not pick larger fonts at higher
+		// resolutions the way UT's does, so at 1 texel = 1 logical pixel its menus were unreadably
+		// small on the panel (observed on Quest 3). Pixel-double it to the original 800x600 look.
+		Canvas.uiscale = MenuUIScale();
+	}
 
 	SceneNode frame;
 	Canvas.Frame.XB = 0;
@@ -35,10 +56,54 @@ void RenderSubsystem::ResetCanvas()
 	Canvas.Frame.WorldToView = mat4::identity();
 	Canvas.Frame.FovAngle = engine->CameraFovAngle;
 	float Aspect = Canvas.Frame.FY / Canvas.Frame.FX;
-	float RProjZ = (float)std::tan(radians(Canvas.Frame.FovAngle) * 0.5f);
-	float RFX2 = 2.0f * RProjZ / Canvas.Frame.FX;
-	float RFY2 = 2.0f * RProjZ * Aspect / Canvas.Frame.FY;
-	Canvas.Frame.Projection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+	if (VREyeOverride.Active)
+	{
+		// VR HUD placement. DrawTile & co (VulkanRenderDevice.cpp) unproject each screen pixel
+		// onto a view-space plane using RFX2/RFY2, i.e. a SYMMETRIC tangent range of
+		// +-RProjZ derived from FovAngle - the HUD is effectively a flat card of that angular
+		// size straight ahead. Projecting that card with the matching symmetric frustum (the
+		// desktop path below) centers it on the IMAGE center of each eye - but with a real
+		// HMD's asymmetric per-eye FOV, "straight ahead" sits ~25% of the image width off
+		// center (leftwards in the left eye, rightwards in the right), so identical-pixel HUD
+		// in both eyes lands on opposite sides of forward: a divergent disparity no one can
+		// fuse. Confirmed on real Quest 3 hardware as "all HUDs and text doubled" (and very
+		// likely the crosshair half of the long-running "eyes too different" report).
+		//
+		// So instead: keep the symmetric card (RFX2/RFY2 stay consistent with it), but project
+		// it through the eye's REAL projection, so it's anchored to the forward direction in
+		// both eyes. Two refinements: (1) the card must fit inside the narrower nasal side of
+		// BOTH eyes, otherwise its outer edges fall off one eye's image - so FovAngle here is
+		// derived from the projection's smaller half-tangents instead of CameraFovAngle;
+		// (2) a card at infinity is uncomfortable against a nearby world, so shift it in
+		// clip space by half the IPD over a 2m viewing distance, bringing it to ~2m.
+		const mat4& P = VREyeOverride.Projection; // column-major, P[col*4+row]
+		float diffX = 2.0f / P[0 * 4 + 0];                // tR - tL (near plane = 1)
+		float sumX = P[2 * 4 + 0] * diffX;                // +-(tR + tL) - sign is irrelevant below
+		float diffY = 2.0f / P[1 * 4 + 1];
+		float sumY = P[2 * 4 + 1] * diffY;
+		float nasalX = std::min(std::fabs((sumX + diffX) * 0.5f), std::fabs((sumX - diffX) * 0.5f));
+		float nasalY = std::min(std::fabs((sumY + diffY) * 0.5f), std::fabs((sumY - diffY) * 0.5f));
+		// 0.65 of the nasal FOV rather than nearly all of it: at ~40 degrees off-center the
+		// HUD's corner elements (score, health, ammo) fell outside the comfortable field of
+		// view on real Quest 3 hardware ("out of my sight range") - this pulls them in to
+		// roughly 27 degrees.
+		float hudHalfTangent = std::min(nasalX, nasalY / Aspect) * 0.65f;
+		Canvas.Frame.FovAngle = degrees(2.0f * std::atan(hudHalfTangent));
+
+		const float halfIpdMeters = 0.032f;
+		const float hudDistanceMeters = 2.0f;
+		float ndcShift = (halfIpdMeters / hudDistanceMeters) * P[0 * 4 + 0]; // tangent shift -> NDC via 2/(tR-tL)
+		if (VREyeOverride.Eye == 1)
+			ndcShift = -ndcShift; // left eye sees a 2m object right of forward, right eye left of it
+		if (RenderingScopeTexture)
+			ndcShift = 0.0f; // the scope is a mono render, its reticle must sit dead center
+		Canvas.Frame.Projection = mat4::translate(vec3(ndcShift, 0.0f, 0.0f)) * P;
+	}
+	else
+	{
+		float RProjZ = (float)std::tan(radians(Canvas.Frame.FovAngle) * 0.5f);
+		Canvas.Frame.Projection = mat4::frustum(-RProjZ, RProjZ, -Aspect * RProjZ, Aspect * RProjZ, 1.0f, 32768.0f, handedness::left, clipzrange::zero_positive_w);
+	}
 
 	int sizeX = (int)(engine->viewport->ViewportWidth() / (float)Canvas.uiscale);
 	int sizeY = (int)(engine->viewport->ViewportHeight() / (float)Canvas.uiscale);
@@ -121,11 +186,124 @@ void RenderSubsystem::DrawActor(UActor* actor, bool WireFrame, bool ClearZ)
 	if (ClearZ)
 		Device->ClearZ();
 
+	// VR: Canvas.DrawActor is how the first-person weapon gets drawn (the script's
+	// RenderOverlays event places the weapon at the eye + PlayerViewOffset, then calls this),
+	// which in VR would leave it floating in front of the face, glued to the head. Instead
+	// hold it in the right hand: put it at the right controller's world position (same
+	// STAGE-to-world chain the eye cameras use, so hand and eyes agree on where the room is)
+	// pointing along the controller's aim direction (VRInput::GetAimRotation, the same
+	// rotation weapon fire is overridden to). Restored afterwards so the script's own
+	// bookkeeping (muzzle flash positions etc.) sees what it set.
+	bool overridden = false;
+	vec3 savedLocation;
+	Rotator savedRotation;
+	float savedDrawScale = 1.0f;
+	// UT's dual Enforcers: the second pistol is a separate "slave" weapon actor (bIsSlave) the
+	// script draws through this same path - that one goes in the LEFT hand.
+	bool slaveWeapon = actor->HasProperty("bIsSlave") && actor->GetBool("bIsSlave");
+	VRInput* vr = engine->vrInput.get();
+	bool handActive = vr && (slaveWeapon ? vr->LeftControllerActive : vr->RightControllerActive);
+	if (VREyeOverride.Active && handActive)
+	{
+		savedLocation = actor->Location();
+		savedRotation = actor->Rotation();
+		savedDrawScale = actor->DrawScale();
+		// Position from the holding hand; direction ALWAYS the right hand's aim - both pistols
+		// fire along the single right-hand crosshair (UT's dual-Enforcer script has one aim), so
+		// the left one pointing where its own controller points would misrepresent where its
+		// shots go.
+		const vec3& handPosition = slaveWeapon ? vr->LeftControllerPosition : vr->RightControllerPosition;
+		actor->Location() = VRCamera::StageToWorldPosition(handPosition, engine->CameraLocation, vr->BodyYawRadians, VRCamera::UnitsPerMeter, vr->HeadAnchorPosition);
+		if (slaveWeapon)
+		{
+			// The second Enforcer's mesh sits higher relative to its origin than the first one
+			// (the second pistol sat visibly higher) - bring it level.
+			const float slaveWeaponDropMeters = 0.07f; // 0 was too high, 0.14 too low
+			actor->Location().z -= slaveWeaponDropMeters * VRCamera::UnitsPerMeter;
+		}
+		// Unreal (Gold) hand offsets (meters, world up). The fire ray runs along the controller aim
+		// through the mesh ORIGIN, but Unreal's first-person meshes are modeled with the barrel a
+		// little ABOVE their origin, so shots appeared to leave below the barrel
+		// (observed on Quest 3). Drop every held mesh so the visual barrel sits on the shot line;
+		// the Eightball keeps its own larger, earlier-tuned drop (not stacked).
+		// Unreal (Gold) per-weapon hand offsets (meters, world up): the Eightball's mesh origin
+		// sits low in its geometry, so it rides high once scaled (sat ~30 cm too high).
+		// (A general 6 cm drop briefly lived here to hide shots landing below the barrel; the real
+		// cause was the fire-convergence origin in VRAimOverrideScope, fixed there.)
+		if (engine->packages->IsUnreal1() && actor->IsA("Eightball"))
+			actor->Location().z -= 0.30f * VRCamera::UnitsPerMeter;
+		// Pistols: lowered 15 cm - they sat too high in the hand.
+		if (engine->packages->IsUnreal1() && (actor->IsA("AutoMag") || actor->IsA("DispersionPistol")))
+			actor->Location().z -= 0.15f * VRCamera::UnitsPerMeter;
+		actor->Rotation() = vr->GetAimRotation();
+		// First-person weapon meshes are modeled for a flat screen where the camera sits right
+		// behind them; held out at arm's length in VR they read as toy-sized (real Quest 3
+		// testing: they read as toy-sized without it).
+		// Tuned on real Quest 3 hardware: 2x too small, 8x too big, 4x confirmed - except the
+		// minigun and flak cannon, whose first-person meshes are modeled noticeably smaller and
+		// needed doubling again.
+		float vrWeaponScale = 4.0f;
+		if (engine->packages->IsUnreal1())
+		{
+			// Unreal (Gold): a uniform 4x for every weapon, settled on after testing on Quest 3
+			// hardware after trying per-weapon tables (8x rocket launcher/minigun/flak, 6x rifle) and two
+			// data-driven variants (scale by PlayerViewOffset; by apparent size = mesh extent / offset).
+			// The numbers those used are still logged once per weapon class for future tuning.
+			static std::set<std::string> loggedClasses;
+			std::string className = UObject::GetUClassName(actor).ToString();
+			if (loggedClasses.insert(className).second)
+			{
+				UMesh* mesh = actor->Mesh();
+				float extent = 0.0f;
+				if (mesh && mesh->FrameVerts > 0 && (size_t)mesh->FrameVerts <= mesh->Verts.size())
+				{
+					vec3 bmin(1e30f), bmax(-1e30f);
+					for (int i = 0; i < mesh->FrameVerts; i++)
+					{
+						vec4 v = mesh->meshToObject * vec4(mesh->Verts[i], 1.0f);
+						bmin = vec3(std::min(bmin.x, v.x), std::min(bmin.y, v.y), std::min(bmin.z, v.z));
+						bmax = vec3(std::max(bmax.x, v.x), std::max(bmax.y, v.y), std::max(bmax.z, v.z));
+					}
+					extent = length(bmax - bmin);
+				}
+				vec3 viewOffset = actor->HasProperty("PlayerViewOffset") ? actor->GetVector("PlayerViewOffset") : vec3(0.0f);
+				LogMessage("VR weapon " + className + ": PlayerViewOffset=(" + std::to_string(viewOffset.x) + "," + std::to_string(viewOffset.y) + "," + std::to_string(viewOffset.z) + ") len=" + std::to_string(length(viewOffset)) + " extent=" + std::to_string(extent) + " scale=" + std::to_string(vrWeaponScale));
+			}
+			// Per-weapon adjustments from Quest 3 testing on top of the uniform 4x default
+			// (Stinger halved, Eightball enlarged).
+			if (actor->IsA("Stinger"))
+				vrWeaponScale = 2.0f;
+			else if (actor->IsA("Eightball"))
+				vrWeaponScale = 8.4f; // 8x proved too small, 12x too big
+			else if (actor->IsA("Rifle")) // the sniper rifle
+				vrWeaponScale = 8.0f;
+			else if (actor->IsA("GESBioRifle"))
+				vrWeaponScale = 8.0f; // undersized at 4x
+			else if (actor->IsA("Razorjack"))
+				vrWeaponScale = 8.0f; // undersized at 4x
+			else if (actor->IsA("FlakCannon"))
+				vrWeaponScale = 8.0f; // undersized at 4x
+		}
+		else if (actor->IsA("minigun2") || actor->IsA("UT_FlakCannon") || actor->IsA("WarheadLauncher") || actor->IsA("ut_biorifle"))
+			vrWeaponScale = 8.0f;
+		else if (actor->IsA("enforcer")) // covers doubleenforcer too; slightly oversized at 4x
+			vrWeaponScale = 2.8f;
+		actor->DrawScale() = savedDrawScale * vrWeaponScale;
+		overridden = true;
+	}
+
 	actor->bHidden() = false;
 	VisibleMesh vismesh;
 	if (vismesh.DrawMesh(&MainFrame, actor, WireFrame, false))
 		vismesh.DrawMesh(&MainFrame, actor, WireFrame, true);
 	actor->bHidden() = true;
+
+	if (overridden)
+	{
+		actor->Location() = savedLocation;
+		actor->Rotation() = savedRotation;
+		actor->DrawScale() = savedDrawScale;
+	}
 
 	Device->SetSceneNode(&Canvas.Frame);
 }
@@ -156,8 +334,23 @@ void RenderSubsystem::DrawClippedActor(UActor* actor, bool WireFrame, int X, int
 
 	actor->bHidden() = false;
 	VisibleMesh vismesh;
+	// VisibleMesh::DrawMesh() reads its view/projection matrices straight from the
+	// VisibleFrame argument's Frame member (VisibleMesh.cpp: frame->Frame.WorldToView), NOT
+	// from whatever Device->SetSceneNode() above was just called with - those are two
+	// different things Device tracks separately. Passing &MainFrame here means this preview
+	// draw was silently using MainFrame.Frame's transform - in VR, whatever the CURRENT eye's
+	// live head-tracked camera happens to be - instead of the neutral, fixed `frame` built
+	// above for exactly this preview. Confirmed as a real bug (not VR-specific, just far more
+	// visible with stereo depth cues exposing it) by an equivalent, already-fixed issue in a
+	// sibling VR port project (Sauerbraten-Quest/rendergl.cpp's setcammatrix(), which hit the
+	// identical symptom - "way too much difference between the eyes" on a menu preview model -
+	// tracing to the same class of mistake: a should-be-fixed camera pass inheriting the live
+	// head-tracked one). Temporarily swap in the correct transform for this call only.
+	SceneNode savedMainFrame = MainFrame.Frame;
+	MainFrame.Frame = frame;
 	if (vismesh.DrawMesh(&MainFrame, actor, WireFrame, false))
 		vismesh.DrawMesh(&MainFrame, actor, WireFrame, true);
+	MainFrame.Frame = savedMainFrame;
 	actor->bHidden() = true;
 
 	Device->SetSceneNode(&Canvas.Frame);
@@ -184,6 +377,56 @@ void RenderSubsystem::DrawTile(UTexture* Tex, float x, float y, float XL, float 
 
 	if (Tex->bMasked())
 		flags |= PF_Masked;
+
+	// VR: the HUD's own crosshair draw (UT's ChallengeHUD.DrawCrosshair -> Canvas.DrawIcon ->
+	// here, with the player's configured CrosshairTextures[Crosshair] - see
+	// UpdateVRAimPoint(), RenderSubsystem.cpp) is redirected from screen center to a
+	// camera-facing billboard where the right controller's aim ray hits the world. Same
+	// texture, color, style flags and on-screen size as the game intended (the tile's pixel
+	// size is converted to the same angular size via the canvas' pixel-to-tangent factors,
+	// then scaled by the hit distance), so the player's crosshair choice is honored and
+	// nothing else about the HUD changes.
+	// The weapon's muzzle flash (TournamentWeapon.DrawMuzzleFlash -> Canvas.DrawIcon(MFTexture))
+	// gets the same redirect, anchored at the gun's muzzle instead of the aim point - as a 2D
+	// icon it followed the head, not the gun (Quest 3 testing on the minigun).
+	auto matches = [&](UTexture* wanted) { return wanted && (Tex == wanted || Tex == wanted->GetAnimTexture()); };
+	bool isCrosshair = matches(VRAim.CrosshairTexture);
+	bool isMuzzleFlash = !isCrosshair && VREyeOverride.Active && matches(CurrentMuzzleFlashTexture());
+	if (VREyeOverride.Active && VRAim.Valid && (isCrosshair || isMuzzleFlash))
+	{
+		// Anchor and the distance that sets the billboard's world size (so it keeps the
+		// on-screen size the game intended, measured from the viewer).
+		vec3 anchor = isCrosshair ? VRAim.HitPoint - VRAim.Dir * (VRAim.Dist * 0.005f) : VRAim.MuzzlePoint; // crosshair fractionally in front of the hit surface
+		float dist = isCrosshair ? VRAim.Dist : std::max(length(VRAim.MuzzlePoint - VREyeOverride.EyeLocation), 1.0f);
+
+		float Aspect = Canvas.Frame.FY / Canvas.Frame.FX;
+		float RProjZ = (float)std::tan(radians(Canvas.Frame.FovAngle) * 0.5f);
+		float RFX2 = 2.0f * RProjZ / Canvas.Frame.FX;
+		float RFY2 = 2.0f * RProjZ * Aspect / Canvas.Frame.FY;
+		float halfW = dist * RFX2 * XL * Canvas.uiscale * 0.5f;
+		float halfH = dist * RFY2 * YL * Canvas.uiscale * 0.5f;
+
+		vec3 right = VREyeOverride.EyeRotation.YAxis;
+		vec3 up = VREyeOverride.EyeRotation.ZAxis;
+		vec3 center = anchor;
+
+		GouraudVertex pts[4];
+		pts[0].Point = center - right * halfW + up * halfH; pts[0].UV = vec2(U, V);
+		pts[1].Point = center + right * halfW + up * halfH; pts[1].UV = vec2(U + UL, V);
+		pts[2].Point = center + right * halfW - up * halfH; pts[2].UV = vec2(U + UL, V + VL);
+		pts[3].Point = center - right * halfW - up * halfH; pts[3].UV = vec2(U, V + VL);
+		for (GouraudVertex& p : pts)
+		{
+			p.Light = color.xyz();
+			p.Fog = vec4(0.0f);
+		}
+
+		Device->SetSceneNode(&MainFrame.Frame);
+		Device->ClearZ(); // always visible, like the HUD element it replaces
+		Device->DrawGouraudPolygon(&MainFrame.Frame, texinfo, pts, 4, flags);
+		Device->SetSceneNode(&Canvas.Frame);
+		return;
+	}
 
 	Device->DrawTile(&Canvas.Frame, texinfo, x * Canvas.uiscale, y * Canvas.uiscale, XL * Canvas.uiscale, YL * Canvas.uiscale, U, V, UL, VL, Z, color, fog, flags);
 }

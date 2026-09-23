@@ -74,7 +74,7 @@ bool UActor::SetLocation(const vec3& newLocation)
 		}
 
 		// Untouch everything we aren't overlapping anymore
-		if (engine->LaunchInfo.IsUnrealTournament_469())
+		if (PropOffsets_Actor.TouchingIsDynamicArray)
 		{
 			for (const auto actor : Touching_UT469())
 			{
@@ -538,7 +538,7 @@ CollisionHit UActor::TryMove(const vec3& delta, bool dryRun, bool isOwnBaseBlock
 	}
 
 	// Untouch everything we aren't overlapping anymore
-	if (engine->LaunchInfo.IsUnrealTournament_469())
+	if (PropOffsets_Actor.TouchingIsDynamicArray)
 	{
 		for (const auto actor : Touching_UT469())
 			if (actor && !IsOverlapping(actor))

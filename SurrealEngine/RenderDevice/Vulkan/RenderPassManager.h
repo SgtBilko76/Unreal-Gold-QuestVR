@@ -24,6 +24,13 @@ public:
 	void CreatePresentPipeline();
 	void CreateScreenshotPipeline();
 
+	// VR path: OpenXR's swapchain format doesn't have to match (and on this backend, isn't
+	// the same object as) the desktop WSI SwapChain's format, so Vulkan pipelines built
+	// against Present.RenderPass aren't valid for it - a pipeline is bound to a specific
+	// compatible-render-pass at creation, not just a format. Built lazily on first use, since
+	// most builds of this render device never touch it.
+	void CreatePresentVRRenderPass(VkFormat format);
+
 	void CreatePostprocessRenderPass();
 	void CreateBloomPipeline();
 
@@ -49,6 +56,13 @@ public:
 		std::unique_ptr<VulkanPipeline> Pipeline[16];
 		std::unique_ptr<VulkanPipeline> ScreenshotPipeline[16];
 	} Present;
+
+	struct
+	{
+		std::unique_ptr<VulkanRenderPass> RenderPass;
+		std::unique_ptr<VulkanPipeline> Pipeline[16];
+		VkFormat Format = VK_FORMAT_UNDEFINED;
+	} PresentVR;
 
 	struct
 	{

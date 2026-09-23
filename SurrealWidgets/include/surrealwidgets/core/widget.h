@@ -188,6 +188,33 @@ public:
 	void SwapGLBuffers() { Window()->DispWindow->SwapGLBuffers(); }
 	DisplayWindow::GLFuncPtr GetGLProcAddress(const char* name) { return Window()->DispWindow->GetGLProcAddress(name); }
 
+	// Stereo VR support (OpenXR backend only) - see DisplayWindow in window.h for details.
+	bool IsStereoDisplay() { return Window()->DispWindow->IsStereoDisplay(); }
+	int GetEyeCount() { return Window()->DispWindow->GetEyeCount(); }
+	void GetEyeImageSize(int eye, int* width, int* height) { Window()->DispWindow->GetEyeImageSize(eye, width, height); }
+	std::vector<std::string> GetVulkanInstanceRequirements() { return Window()->DispWindow->GetVulkanInstanceRequirements(); }
+	std::vector<std::string> GetVulkanDeviceRequirements() { return Window()->DispWindow->GetVulkanDeviceRequirements(); }
+	VkPhysicalDevice SelectVulkanPhysicalDevice(VkInstance instance) { return Window()->DispWindow->SelectVulkanPhysicalDevice(instance); }
+	void CreateVulkanSession(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex) { Window()->DispWindow->CreateVulkanSession(instance, physicalDevice, device, queueFamilyIndex, queueIndex); }
+	bool WaitFrame() { return Window()->DispWindow->WaitFrame(); }
+	StereoEyeView GetEyeView(int eye) { return Window()->DispWindow->GetEyeView(eye); }
+	int AcquireEyeImage(int eye) { return Window()->DispWindow->AcquireEyeImage(eye); }
+	VkImage GetEyeImage(int eye, int imageIndex) { return Window()->DispWindow->GetEyeImage(eye, imageIndex); }
+	void ReleaseEyeImage(int eye) { Window()->DispWindow->ReleaseEyeImage(eye); }
+	void EndFrame() { Window()->DispWindow->EndFrame(); }
+	void CreateScreenLayerSwapchain(int width, int height) { Window()->DispWindow->CreateScreenLayerSwapchain(width, height); }
+	void GetScreenLayerImageSize(int* width, int* height) { Window()->DispWindow->GetScreenLayerImageSize(width, height); }
+	int AcquireScreenLayerImage() { return Window()->DispWindow->AcquireScreenLayerImage(); }
+	VkImage GetScreenLayerImage(int imageIndex) { return Window()->DispWindow->GetScreenLayerImage(imageIndex); }
+	void ReleaseScreenLayerImage() { Window()->DispWindow->ReleaseScreenLayerImage(); }
+	void SetScreenLayerPose(float positionX, float positionY, float positionZ, float orientationX, float orientationY, float orientationZ, float orientationW, float widthMeters, float heightMeters) { Window()->DispWindow->SetScreenLayerPose(positionX, positionY, positionZ, orientationX, orientationY, orientationZ, orientationW, widthMeters, heightMeters); }
+	void SetScreenLayerActive(bool active) { Window()->DispWindow->SetScreenLayerActive(active); }
+	bool ConsumeRecenterEvent() { return Window()->DispWindow->ConsumeRecenterEvent(); }
+	MotionControllerPose GetHeadPose() { return Window()->DispWindow->GetHeadPose(); }
+	MotionControllerPose GetControllerPose(VRControllerHand hand) { return Window()->DispWindow->GetControllerPose(hand); }
+	VRControllerState GetControllerState(VRControllerHand hand) { return Window()->DispWindow->GetControllerState(hand); }
+	void TriggerHapticPulse(VRControllerHand hand, float amplitude, float durationSeconds) { Window()->DispWindow->TriggerHapticPulse(hand, amplitude, durationSeconds); }
+
 protected:
 	virtual void OnPaintFrame(Canvas* canvas);
 	virtual void OnPaint(Canvas* canvas) { }

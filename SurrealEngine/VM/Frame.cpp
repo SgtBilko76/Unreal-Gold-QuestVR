@@ -230,14 +230,34 @@ ExpressionValue Frame::Call(UFunction* func, UObject* instance, Array<Expression
 		}
 	}
 
-	if (AllFlags(func->FuncFlags, FunctionFlags::Native))
+	// `singular` functions: skipped entirely if this object is already inside a singular
+	// function (UE1's RF_InSingularFunc) - see UObject::InSingularFunction.
+	bool singular = AllFlags(func->FuncFlags, FunctionFlags::Singular);
+	if (singular)
 	{
-		return CallNative(func, instance, std::move(args));
+		if (instance->InSingularFunction)
+			return ExpressionValue::NothingValue();
+		instance->InSingularFunction = true;
 	}
-	else
+
+	ExpressionValue result;
+	try
 	{
-		return CallScript(func, instance, std::move(args));
+		if (AllFlags(func->FuncFlags, FunctionFlags::Native))
+			result = CallNative(func, instance, std::move(args));
+		else
+			result = CallScript(func, instance, std::move(args));
 	}
+	catch (...)
+	{
+		if (singular)
+			instance->InSingularFunction = false;
+		throw;
+	}
+
+	if (singular)
+		instance->InSingularFunction = false;
+	return result;
 }
 
 ExpressionValue Frame::CallScript(UFunction* func, UObject* instance, Array<ExpressionValue> args)

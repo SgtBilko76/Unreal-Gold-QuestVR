@@ -318,9 +318,9 @@ PackageManager::PackageManager(const GameLaunchInfo& launchInfo) : launchInfo(la
 	RegisterFunctions();
 	LoadEngineIniFiles();
 	LoadFileExtensions();
-	LoadIntFiles();
 	LoadPackageRemaps();
 	ScanPaths();
+	LoadIntFiles(); // after ScanPaths(): needs the LangPaths folders it records
 	ScanForMaps();
 
 	if (launchInfo.IsDeusEx())
@@ -492,12 +492,18 @@ void PackageManager::ScanPaths()
 	const auto cachePath = convert_path_separators(GetIniValue("System", "Core.System", "CachePath"));
 	gameCacheFolderPath = (gameSystemFolderPath / cachePath).lexically_normal();
 
-	// Unreal 227j+ and UT 469d+ store localization files in SystemLocalized folder
-	if ((IsUnreal1_227() && launchInfo.gameSubVersion >= 10) || (IsUnrealTournament_469() && launchInfo.gameSubVersion >= 4))
+	// Unreal 227j+ and UT 469 store localization files in the SystemLocalized folder, declared
+	// through Core.System LangPaths. Keyed on the ini actually having LangPaths rather than on
+	// the exact sub-version: a real 469c install (OldUnreal469c.u) already ships ALL its .int
+	// files under SystemLocalized/int with none left in System, and gating this on "469d+"
+	// left it with no localization at all - no game types in the Start Match menu, which
+	// then crashed on a None game class.
 	{
 		auto langpaths = GetIniValues("System", "Core.System", "LangPaths");
 
-		// Substitute <lang> with the actual language extension
+		// Substitute <lang> with the actual language extension. These are localization TEXT
+		// files, not packages - only their folders are kept (see localizationFolders in the
+		// header for why they must not go through the package scan below).
 		for (auto& langpath : langpaths)
 		{
 			auto pos = langpath.find("<lang>");
@@ -507,7 +513,8 @@ void PackageManager::ScanPaths()
 				pos = langpath.find("<lang>");
 			}
 
-			paths.push_back(langpath);
+			auto folder = (gameSystemFolderPath / convert_path_separators(langpath)).lexically_normal().parent_path();
+			localizationFolders.push_back(folder.string());
 		}
 	}
 
@@ -598,10 +605,11 @@ void PackageManager::RemoveSaveInfoPackage(const NameString& saveFolderName)
 
 std::shared_ptr<PackageStream> PackageManager::GetStream(Package* package)
 {
+	const std::string& path = package->GetPackageFilePath();
 	int numStreams = 0;
 	for (auto it = openStreams.begin(); it != openStreams.end(); ++it)
 	{
-		if ((*it).Pkg == package)
+		if ((*it).Pkg == package && (*it).Path == path)
 		{
 			if (it != openStreams.begin())
 			{
@@ -616,7 +624,8 @@ std::shared_ptr<PackageStream> PackageManager::GetStream(Package* package)
 
 	OpenStream s;
 	s.Pkg = package;
-	s.Stream = std::make_shared<PackageStream>(package, File::open_existing(package->GetPackageFilePath()));
+	s.Path = path;
+	s.Stream = std::make_shared<PackageStream>(package, File::open_existing(path));
 	openStreams.push_front(s);
 
 	if (numStreams == 10)
@@ -694,8 +703,14 @@ std::unique_ptr<IniFile>& PackageManager::LoadIniFile(NameString iniName)
 	auto& ini = iniFiles[iniName];
 	if (!ini)
 	{
+		// Per-package config (`config(udemo)` classes etc.): UE1 treats a missing ini as empty
+		// and writes it on SaveConfig. Throwing here made every class of such a package
+		// unloadable (udemo.UDmodItem from the UT 469 mod menu, taking the whole menu down).
 		const auto iniFilePath = gameSystemFolderPath / (iniName.ToString() + ".ini");
-		ini = std::make_unique<IniFile>(iniFilePath.string());
+		if (fs::exists(iniFilePath))
+			ini = std::make_unique<IniFile>(iniFilePath.string());
+		else
+			ini = std::make_unique<IniFile>();
 	}
 
 	return ini;
@@ -868,15 +883,24 @@ void PackageManager::LoadFileExtensions()
 
 void PackageManager::LoadIntFiles()
 {
-	for (const auto& dir_entry: fs::directory_iterator{gameSystemFolderPath})
+	// System plus the LangPaths folders (ScanPaths() must have run first) - UT 469 keeps its
+	// .int files in SystemLocalized/int only.
+	Array<fs::path> intFolders;
+	intFolders.push_back(gameSystemFolderPath);
+	for (const std::string& folder : localizationFolders)
+		intFolders.push_back(fs::path(folder));
+
+	const std::string intExtension = "." + languageExtension;
+	for (const fs::path& intFolder : intFolders)
+	for (const auto& dir_entry: fs::exists(intFolder) ? fs::directory_iterator{intFolder} : fs::directory_iterator{})
 	{
 		try
 		{
-			if (dir_entry.is_regular_file() && dir_entry.path().extension().string() == ".int")
+			if (dir_entry.is_regular_file() && NameString(dir_entry.path().extension().string()) == NameString(intExtension))
 			{
 				const auto intFileName = dir_entry.path().filename();
 
-				auto intFile = std::make_unique<IniFile>((gameSystemFolderPath / intFileName).string());
+				auto intFile = std::make_unique<IniFile>((intFolder / intFileName).string());
 
 				for (const std::string& value: intFile->GetValues("Public", "Object"))
 				{
@@ -944,15 +968,28 @@ std::string PackageManager::Localize(NameString packageName, const NameString& s
 	auto& intFile = intFiles[packageName];
 	if (!intFile)
 	{
-		try
+		// System/<package>.int first, then the LangPaths folders (SystemLocalized/<lang> on
+		// Unreal 227j+ / UT 469d+).
+		const auto intFileName = fs::path(packageName.ToString() + "." + languageExtension);
+		Array<fs::path> candidates;
+		candidates.push_back(gameSystemFolderPath / intFileName);
+		for (const std::string& folder : localizationFolders)
+			candidates.push_back(fs::path(folder) / intFileName);
+		for (const fs::path& candidate : candidates)
 		{
-			const auto intFileName = fs::path(packageName.ToString() + ".int");
-			intFile = std::make_unique<IniFile>((gameSystemFolderPath / intFileName).string());
+			if (!fs::exists(candidate))
+				continue;
+			try
+			{
+				intFile = std::make_unique<IniFile>(candidate.string());
+				break;
+			}
+			catch (...)
+			{
+			}
 		}
-		catch (...)
-		{
+		if (!intFile)
 			intFile = std::make_unique<IniFile>();
-		}
 	}
 
 	std::string value = intFile->GetValue(sectionName, keyName, {}, index);

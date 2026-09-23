@@ -1,5 +1,8 @@
 
 #include "Precomp.h"
+#ifdef ANDROID
+#include <android/log.h>
+#endif
 #include "NObject.h"
 #include "VM/NativeFunc.h"
 #include "VM/Frame.h"
@@ -680,6 +683,13 @@ void NObject::DynamicLoadObject(const std::string& ObjectName, UObject* ObjectCl
 			try
 			{
 				ReturnValue = engine->packages->GetPackage(packageName)->GetUObject(ObjectClass->Name, objectName);
+			}
+			catch (const std::exception& e)
+			{
+				LogMessage("Object.DynamicLoadObject: loading '" + ObjectName + "' failed: " + e.what());
+#ifdef ANDROID
+				__android_log_print(ANDROID_LOG_WARN, "SurrealEngine", "DynamicLoadObject('%s') failed: %s", ObjectName.c_str(), e.what());
+#endif
 			}
 			catch (...)
 			{

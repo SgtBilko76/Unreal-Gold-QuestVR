@@ -22,6 +22,10 @@ IniFile::IniFile(const std::string& filename)
 {
 	std::string text = File::read_all_text(filename);
 	size_t pos = 0;
+	// UT 469's localization (.int) files carry a UTF-8 byte order mark; without skipping it
+	// the first line reads as "\xEF\xBB\xBF[Public]" and that section is never found.
+	if (text.size() >= 3 && (uint8_t)text[0] == 0xEF && (uint8_t)text[1] == 0xBB && (uint8_t)text[2] == 0xBF)
+		pos = 3;
 	std::string line;
 	std::string sectionName;
 	while (ReadLine(text, pos, line))

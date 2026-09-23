@@ -15,8 +15,15 @@ void RenderSubsystem::DrawScene()
 	if (!engine->Level)
 		return;
 
-	engine->Level->Light.BeginFrame();
-	TextureFrameCounter++;
+	// Light.BeginFrame()/TextureFrameCounter++ intentionally live in BeginVRFrame()/DrawGame()
+	// instead of here - see their call sites' comments. DrawScene() runs once per EYE in VR
+	// (twice per app-frame), but both of those represent per-app-frame state (light tree
+	// rebuild + flicker/pulse timing, texture animation gating) - calling them here would
+	// silently double their effective rate under VR and let flicker-light timing diverge
+	// between the two eyes' otherwise-identical scene (confirmed on real Quest 3 hardware via
+	// a diagnostic build that forced both eyes to render from identical camera data: the
+	// doubling/ghosting persisted even then, which ruled out a stereo/camera bug and pointed
+	// at exactly this kind of per-call-instead-of-per-frame state).
 
 	// Make sure all actors are at the right location in the BSP
 	for (UActor* actor : engine->Level->Actors)
@@ -25,8 +32,15 @@ void RenderSubsystem::DrawScene()
 			actor->UpdateBspInfo();
 	}
 
-	mat4 worldToView = Coords::ViewToRenderDev().ToMatrix() * Coords::Rotation(engine->CameraRotation).Inverse().ToMatrix() * Coords::Location(engine->CameraLocation).ToMatrix();
-	MainFrame.Process(engine->CameraLocation, worldToView, Coords::Rotation(engine->CameraRotation));
+	if (VREyeOverride.Active)
+	{
+		MainFrame.Process(VREyeOverride.EyeLocation, VREyeOverride.WorldToView, VREyeOverride.EyeRotation, false, 0, {}, vec4(0.0f, 0.0f, 0.0f, 1.0f), &VREyeOverride.Projection);
+	}
+	else
+	{
+		mat4 worldToView = Coords::ViewToRenderDev().ToMatrix() * Coords::Rotation(engine->CameraRotation).Inverse().ToMatrix() * Coords::Location(engine->CameraLocation).ToMatrix();
+		MainFrame.Process(engine->CameraLocation, worldToView, Coords::Rotation(engine->CameraRotation));
+	}
 	MainFrame.Draw();
 	MainFrame.DrawCoronas();
 }
