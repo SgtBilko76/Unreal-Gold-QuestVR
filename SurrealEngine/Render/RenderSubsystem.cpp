@@ -234,11 +234,12 @@ void RenderSubsystem::DrawMenuScreen(int imageIndex, VkImage screenImage, int wi
 
 int RenderSubsystem::MenuUIScale() const
 {
-	// Unreal (Gold): its older UWindow/UMenu does not pick larger fonts at higher resolutions the
-	// way UT's does, so 1 texel = 1 logical pixel made its menus unreadably small on the panel
-	// (observed on Quest 3). Pixel-double it to the original 800x600 look. UT stays 1:1 (tuned
-	// separately - see ResetCanvas).
-	return engine->LaunchInfo.ue1Version < 400 ? 2 : 1;
+	// Pixel-double the menu (800x600 logical onto the ~1600px panel texture) for both games. At
+	// 1 texel = 1 logical pixel the menu fonts render at their native pixel size, which on the
+	// arm's-length VR panel is too small to read - reported for UT as well as Unreal Gold. The
+	// controller-ray cursor is scaled by this same factor (see RunVRMenuScreen), so clicks stay
+	// aligned with what is drawn.
+	return 2;
 }
 
 void RenderSubsystem::RenderMenuTexture(int width, int height)

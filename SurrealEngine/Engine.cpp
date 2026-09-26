@@ -2003,79 +2003,51 @@ void Engine::RunVRMenuScreen()
 	render->RenderMenuTexture(eyeWidth, eyeHeight);
 	vec2 uvMax((float)canvasWidth / (float)eyeWidth, (float)canvasHeight / (float)eyeHeight);
 
-	// Curved screen: a vertical cylinder segment of radius screenDistanceMeters centered on
-	// where the head was when the menu opened (so every point of the panel is the same
-	// distance from the viewer - a slightly curved screen). Arc length
-	// = screenWidthMeters, so the angular span is width / radius (~82 degrees at 3.6m / 2.5m).
-	// Built as a fan of flat strips, each showing its slice of the texture.
-	const int stripCount = 16;
-	const float radius = screenDistanceMeters;
-	const float totalAngle = screenWidthMeters / radius;
+	// Flat screen: a single planar quad facing the viewer. A curved panel was tried first, but the
+	// curvature made menu text harder to read, so the panel is flat (spanning quadRight x quadUp,
+	// normal quadForward). The cursor is a ray-vs-plane hit mapped to canvas pixels - geometry and
+	// cursor share the same plane so clicks stay aligned with what is drawn.
 	const float halfH = screenHeightMeters * 0.5f;
-	vec3 cylinderCenter = quadPos - quadForward * radius; // head position at open time
-	auto pointOnCylinder = [&](float angle, float y) -> vec3
+	const float halfW = screenWidthMeters * 0.5f;
 	{
-		// angle 0 = straight ahead, positive = towards quadRight
-		vec3 dir = quadForward * std::cos(angle) + quadRight * std::sin(angle);
-		return cylinderCenter + dir * radius + quadUp * y;
-	};
-	RenderSubsystem::MenuStrip strips[stripCount];
-	for (int i = 0; i < stripCount; i++)
-	{
-		float a0 = -totalAngle * 0.5f + totalAngle * (float)i / stripCount;
-		float a1 = -totalAngle * 0.5f + totalAngle * (float)(i + 1) / stripCount;
 		vec3 stageCorners[4] = {
-			pointOnCylinder(a0, +halfH), // top-left
-			pointOnCylinder(a1, +halfH), // top-right
-			pointOnCylinder(a1, -halfH), // bottom-right
-			pointOnCylinder(a0, -halfH), // bottom-left
+			quadPos - quadRight * halfW + quadUp * halfH, // top-left
+			quadPos + quadRight * halfW + quadUp * halfH, // top-right
+			quadPos + quadRight * halfW - quadUp * halfH, // bottom-right
+			quadPos - quadRight * halfW - quadUp * halfH, // bottom-left
 		};
+		RenderSubsystem::MenuStrip strip;
 		for (int c = 0; c < 4; c++)
-			strips[i].Corners[c] = VRCamera::StageToWorldPosition(stageCorners[c], CameraLocation, vrInput->BodyYawRadians, VRUnitsPerMeter, vrInput->HeadAnchorPosition);
-		strips[i].UVMin = vec2(uvMax.x * (float)i / stripCount, 0.0f);
-		strips[i].UVMax = vec2(uvMax.x * (float)(i + 1) / stripCount, uvMax.y);
+			strip.Corners[c] = VRCamera::StageToWorldPosition(stageCorners[c], CameraLocation, vrInput->BodyYawRadians, VRUnitsPerMeter, vrInput->HeadAnchorPosition);
+		strip.UVMin = vec2(0.0f, 0.0f);
+		strip.UVMax = uvMax;
+		render->SetMenuWorldStrips(true, &strip, 1);
 	}
-	render->SetMenuWorldStrips(true, strips, stripCount);
 
-	// Cursor: intersect the controller ray with that cylinder (infinite height, vertical axis
-	// through cylinderCenter), then map the hit's angle/height to canvas pixels.
+	// Cursor: intersect the controller ray with the panel plane (point quadPos, normal quadForward).
 	vec3 rayOrigin = vrInput->RightControllerPosition; // already raw OpenXR/STAGE space, no UE1 remap
 	vec3 rayDir = GetOpenXRForwardRaw(vrInput->RightControllerOrientation[0], vrInput->RightControllerOrientation[1], vrInput->RightControllerOrientation[2], vrInput->RightControllerOrientation[3]);
 
-	vec3 rel = rayOrigin - cylinderCenter;
-	float a = rayDir.x * rayDir.x + rayDir.z * rayDir.z;
-	float b = 2.0f * (rel.x * rayDir.x + rel.z * rayDir.z);
-	float c = rel.x * rel.x + rel.z * rel.z - radius * radius;
-	if (a < 0.000001f)
-		return; // aiming straight up/down - no sensible hit point
-	float disc = b * b - 4.0f * a * c;
-	if (disc < 0.0f)
-		return;
-	float sq = std::sqrt(disc);
-	float t = (-b + sq) / (2.0f * a); // the far root: from inside the cylinder this is the wall in front of the ray
+	float denom = dot(rayDir, quadForward);
+	if (std::fabs(denom) < 0.000001f)
+		return; // ray parallel to the panel
+	float t = dot(quadPos - rayOrigin, quadForward) / denom;
 	if (t <= 0.0f)
 		return;
 
 	vec3 hitPoint = rayOrigin + rayDir * t;
-	vec3 hitRel = hitPoint - cylinderCenter;
-	float hitAngle = std::atan2(dot(hitRel, quadRight), dot(hitRel, quadForward)); // 0 = straight ahead, + = right
+	vec3 hitRel = hitPoint - quadPos;
+	float localX = dot(hitRel, quadRight);
 	float localY = dot(hitRel, quadUp);
 
-#ifdef ANDROID
-	static int menuCursorDiagCounter = 0;
-	if ((++menuCursorDiagCounter % 30) == 0)
-		__android_log_print(ANDROID_LOG_INFO, "SurrealEngine-VRDiag", "MenuCursor: t=%.3f angle=%.3f (span %.3f) localY=%.3f (halfH %.2f) rightActive=%d", t, hitAngle, totalAngle, localY, halfH, vrInput->RightControllerActive ? 1 : 0);
-#endif
-
-	// Outside the physical panel - don't clamp onto an edge (would make the cursor stick to a
-	// border whenever aiming away), just leave the cursor wherever it last was.
-	if (std::fabs(hitAngle) > totalAngle * 0.5f || std::fabs(localY) > halfH)
+	// Outside the physical panel - leave the cursor wherever it last was.
+	if (std::fabs(localX) > halfW || std::fabs(localY) > halfH)
 		return;
 
 	Point cursorPos;
 	// UWindow works in the logical canvas (texture pixels / MenuUIScale), so feed it those units.
 	const int menuUIScale = render->MenuUIScale();
-	cursorPos.x = (hitAngle / totalAngle + 0.5) * canvasWidth / menuUIScale;
+	cursorPos.x = (localX / screenWidthMeters + 0.5) * canvasWidth / menuUIScale;
 	cursorPos.y = (0.5 - localY / screenHeightMeters) * canvasHeight / menuUIScale; // screen Y grows downward, quadUp grows upward
 
 	OnWindowMouseMove(cursorPos);
