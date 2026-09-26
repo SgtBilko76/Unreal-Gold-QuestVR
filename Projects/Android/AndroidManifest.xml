@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.dpjudas.surrealengine"
-    android:versionCode="12"
-    android:versionName="1.0.0-beta9"
+    android:versionCode="13"
+    android:versionName="1.0.0-beta10"
     android:installLocation="auto" >
 
 	<!-- Vulkan 1.1 is required for XR_KHR_vulkan_enable2 -->
