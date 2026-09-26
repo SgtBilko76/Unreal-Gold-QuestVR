@@ -265,6 +265,14 @@ GameLaunchInfo GameFolderSelection::ExamineFolder(const std::string& path)
 				info.gameVersionString = "469e";
 			}
 			break;
+			case KnownUE1Games::UT99_469f:
+			{
+				info.gameName = "Unreal Tournament";
+				info.gameVersion = 469;
+				info.gameSubVersion = 6;
+				info.gameVersionString = "469f";
+			}
+			break;
 			case KnownUE1Games::DEUS_EX_1002f:
 			{
 				info.gameName = "Deus Ex";

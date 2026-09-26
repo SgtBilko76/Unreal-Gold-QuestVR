@@ -27,6 +27,7 @@ enum class KnownUE1Games
 	UT99_469c,
 	UT99_469d,
 	UT99_469e,
+	UT99_469f,
 	DEUS_EX_1002f,
 	DEUS_EX_1112fm,
 	KLINGON_219,
@@ -142,6 +143,9 @@ static const std::map<std::string, KnownUE1Games> SHA1Database = {
 	// Unreal Tournament, v469e, Windows + Linux versions (32 + 64 bit)
 	// Windows
 	{"0bf87fa4530ec9ecb0a144c95fb435ff3464ce15", KnownUE1Games::UT99_469e},
+
+	// Unreal Tournament, 469f (Windows amd64, from rc5 onwards)
+	{"d46f0797fd31cf91e0b740d391f96fe81a7545cc", KnownUE1Games::UT99_469f},
 	// Linux 32 bit (ut-bin-x86)
 	{"412cb72ae6deac8073e49ccad78904a415b90cf8", KnownUE1Games::UT99_469e},
 	// Linux 64 bit (ut-bin-amd64)
