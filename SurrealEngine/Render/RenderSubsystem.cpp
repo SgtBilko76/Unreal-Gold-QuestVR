@@ -253,6 +253,10 @@ void RenderSubsystem::RenderMenuTexture(int width, int height)
 	PreRender();
 	PostRender();
 
+	// On-screen keyboard (VR) over the lower part of the menu, when toggled on.
+	if (vrKeyboardActive)
+		DrawVRKeyboard(vrKeyboardCursorX, vrKeyboardCursorY);
+
 	// Cursor. With bWindowsMouseAvailable set (Engine::Run - required so UWindow reads the
 	// absolute controller-ray position), UT's UWindow system assumes the OS draws the mouse
 	// cursor and draws none of its own; on the Quest nobody else will, so paint a simple

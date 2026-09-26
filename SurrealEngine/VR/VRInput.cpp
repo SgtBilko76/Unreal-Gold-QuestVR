@@ -92,6 +92,9 @@ void VRInput::Update(Widget* window, float deltaSeconds)
 
 	MoveAxisX = ApplyDeadzone(leftState.ThumbstickX);
 	MoveAxisY = ApplyDeadzone(leftState.ThumbstickY);
+
+	KeyboardToggleJustPressed = leftState.ThumbstickClick && !keyboardToggleWasDown; // left stick click toggles the on-screen keyboard
+	keyboardToggleWasDown = leftState.ThumbstickClick;
 	// Digital, not analog: any deflection past the deadzone means full speed in that
 	// direction. UT is a run-by-default game and a linear analog ramp made every movement
 	// ramping up from a slow start - full speed immediately feels better in VR.

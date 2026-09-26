@@ -98,6 +98,7 @@ public:
 	bool CrouchJustReleased = false;
 	bool ActivateItemJustPressed = false; // right controller A (one-shot) - synthesized Enter key tap (Unreal: InventoryActivate)
 	bool NextItemJustPressed = false; // left controller X (one-shot) - synthesized RightBracket key tap (Unreal: InventoryNext)
+	bool KeyboardToggleJustPressed = false; // left thumbstick click (one-shot) - toggles the in-engine on-screen keyboard while the menu is open
 
 	// Raw, undeadzoned analog values behind FirePressed/AltFirePressed - exposed for
 	// diagnostics only (see Engine::RunVR()'s VRDiag log, Engine.cpp) while chasing a real-
@@ -140,6 +141,7 @@ private:
 	bool crouchWasDown = false;
 	bool activateItemWasDown = false;
 	bool nextItemWasDown = false;
+	bool keyboardToggleWasDown = false;
 
 	// Recenter handling: the runtime announces the reference-space jump a frame or two before
 	// the poses actually reflect it, and Update() reads the previous frame's poses anyway, so

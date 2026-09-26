@@ -954,3 +954,90 @@ void RenderSubsystem::SetTile3DOffset(bool enabled, std::optional<vec3> offset, 
 		Tile3DOffset.Scale = 1.0f;
 	}
 }
+
+// ---------------------------------------------------------------------------
+// In-engine on-screen keyboard (VR). Drawn into the menu texture (logical canvas
+// ~800x600, matching the cursor units RunVRMenuScreen computes) and hit-tested
+// against the same controller-ray cursor.
+// ---------------------------------------------------------------------------
+namespace
+{
+	struct VRKey { float x, y, w, h; std::string label; int type; char ch; }; // type: 0 char, 1 backspace, 2 enter, 3 shift, 4 space
+
+	std::vector<VRKey> BuildVRKeyboard(bool shift)
+	{
+		std::vector<VRKey> keys;
+		const float left = 16.0f, top = 356.0f, kw = 74.0f, kh = 44.0f, gap = 4.0f;
+		const char* rows[4] = { "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm" };
+		const float rowIndent[4] = { 0.0f, 0.0f, kw * 0.5f, kw * 1.0f };
+		for (int r = 0; r < 4; r++)
+		{
+			float y = top + r * (kh + gap);
+			float x = left + rowIndent[r];
+			for (const char* p = rows[r]; *p; ++p)
+			{
+				char c = *p;
+				if (shift && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+				keys.push_back({ x, y, kw, kh, std::string(1, c), 0, c });
+				x += kw + gap;
+			}
+		}
+		float y = top + 4 * (kh + gap);
+		float x = left;
+		keys.push_back({ x, y, kw * 1.5f, kh, "Shift", 3, 0 }); x += kw * 1.5f + gap;
+		keys.push_back({ x, y, kw * 4.0f, kh, "Space", 4, ' ' }); x += kw * 4.0f + gap;
+		keys.push_back({ x, y, kw * 1.5f, kh, "Del", 1, 0 });     x += kw * 1.5f + gap;
+		keys.push_back({ x, y, kw * 2.0f, kh, "Enter", 2, 0 });
+		return keys;
+	}
+}
+
+void RenderSubsystem::DrawVRKeyboard(float cursorX, float cursorY)
+{
+	UFont* font = engine->canvas ? engine->canvas->MedFont() : nullptr;
+	const vec4 outline(0.60f, 0.60f, 0.70f, 1.0f);
+
+	// Dark backdrop band behind the keys, filled with horizontal lines (no solid-fill primitive
+	// on the 2D canvas). Covers the lower part of the menu while the keyboard is open.
+	for (float yy = 348.0f; yy <= 598.0f; yy += 1.0f)
+		Draw2DLine(vec4(0.04f, 0.04f, 0.07f, 1.0f), 0, vec3(8.0f, yy, 1.0f), vec3(792.0f, yy, 1.0f), true);
+
+	for (const VRKey& k : BuildVRKeyboard(vrKeyboardShift))
+	{
+		bool hover = cursorX >= k.x && cursorX <= k.x + k.w && cursorY >= k.y && cursorY <= k.y + k.h;
+		bool lit = hover || (k.type == 3 && vrKeyboardShift);
+		vec4 fill = lit ? vec4(0.32f, 0.44f, 0.64f, 1.0f) : vec4(0.17f, 0.17f, 0.21f, 1.0f);
+		for (float yy = k.y + 1.0f; yy < k.y + k.h; yy += 1.0f)
+			Draw2DLine(fill, 0, vec3(k.x + 1.0f, yy, 1.0f), vec3(k.x + k.w - 1.0f, yy, 1.0f), true);
+		Draw2DLine(outline, 0, vec3(k.x, k.y, 1.0f), vec3(k.x + k.w, k.y, 1.0f), true);
+		Draw2DLine(outline, 0, vec3(k.x, k.y + k.h, 1.0f), vec3(k.x + k.w, k.y + k.h, 1.0f), true);
+		Draw2DLine(outline, 0, vec3(k.x, k.y, 1.0f), vec3(k.x, k.y + k.h, 1.0f), true);
+		Draw2DLine(outline, 0, vec3(k.x + k.w, k.y, 1.0f), vec3(k.x + k.w, k.y + k.h, 1.0f), true);
+		if (font)
+		{
+			vec2 sz = GetTextSize(font, k.label);
+			float cx = k.x + (k.w - sz.x) * 0.5f;
+			float cy = k.y + (k.h - sz.y) * 0.5f;
+			float cxl = 0.0f, cyl = 0.0f;
+			DrawText(font, vec4(1.0f), 0.0f, 0.0f, cx, cy, cxl, cyl, false, k.label, PF_NoSmooth | PF_Masked, false);
+		}
+	}
+}
+
+RenderSubsystem::VRKeyHit RenderSubsystem::VRKeyboardHitTest(float cursorX, float cursorY) const
+{
+	VRKeyHit hit;
+	for (const VRKey& k : BuildVRKeyboard(vrKeyboardShift))
+	{
+		if (cursorX >= k.x && cursorX <= k.x + k.w && cursorY >= k.y && cursorY <= k.y + k.h)
+		{
+			hit.hit = true;
+			if (k.type == 0 || k.type == 4) hit.ch = k.ch;
+			else if (k.type == 1) hit.backspace = true;
+			else if (k.type == 2) hit.enter = true;
+			else if (k.type == 3) hit.shift = true;
+			return hit;
+		}
+	}
+	return hit;
+}

@@ -66,6 +66,17 @@ public:
 	};
 	void SetMenuWorldStrips(bool active, const MenuStrip* strips, int count);
 
+	// In-engine on-screen keyboard drawn on the menu panel and operated with the controller ray
+	// (the headset system keyboard cannot surface in an immersive OpenXR app). Public so Engine
+	// (RunVRMenuScreen) can toggle it, feed the cursor and route clicks to keys.
+	bool vrKeyboardActive = false;
+	bool vrKeyboardShift = false;
+	float vrKeyboardCursorX = -1000.0f; // last frame's cursor in logical canvas units (for hover)
+	float vrKeyboardCursorY = -1000.0f;
+	struct VRKeyHit { bool hit = false; char ch = 0; bool backspace = false; bool enter = false; bool shift = false; };
+	void DrawVRKeyboard(float cursorX, float cursorY);
+	VRKeyHit VRKeyboardHitTest(float cursorX, float cursorY) const;
+
 	// VR sniper scope (Engine::RunVRScope(), Engine.cpp): renders the 3D world from the gun's
 	// viewpoint with the game's (zoomed) FovAngle into the shared menu texture - a
 	// width x height square at the texture's top-left - with a reticle in the middle. Called

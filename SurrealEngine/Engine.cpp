@@ -1951,6 +1951,7 @@ void Engine::RunVRMenuScreen()
 	{
 		render->SetMenuWorldStrips(false, nullptr, 0);
 		vrMenuScreenPositioned = false; // re-anchor fresh next time the menu opens
+		render->vrKeyboardActive = false; // close the on-screen keyboard when the menu closes
 		return;
 	}
 
@@ -2049,6 +2050,48 @@ void Engine::RunVRMenuScreen()
 	const int menuUIScale = render->MenuUIScale();
 	cursorPos.x = (localX / screenWidthMeters + 0.5) * canvasWidth / menuUIScale;
 	cursorPos.y = (0.5 - localY / screenHeightMeters) * canvasHeight / menuUIScale; // screen Y grows downward, quadUp grows upward
+
+	render->vrKeyboardCursorX = (float)cursorPos.x;
+	render->vrKeyboardCursorY = (float)cursorPos.y;
+	if (vrInput->KeyboardToggleJustPressed)
+		render->vrKeyboardActive = !render->vrKeyboardActive;
+
+	if (render->vrKeyboardActive)
+	{
+		RenderSubsystem::VRKeyHit hk = render->VRKeyboardHitTest((float)cursorPos.x, (float)cursorPos.y);
+		if (hk.hit)
+		{
+			OnWindowMouseMove(cursorPos); // keep the pointer visible over the keys
+			if (vrInput->TriggerJustPressed)
+			{
+				// UWindow edit boxes only insert on KeyType while bKeyDown is set, which a KeyDown
+				// sets and a KeyUp clears - so each character needs the full KeyDown/KeyType/KeyUp
+				// sequence, not KeyType alone. Backspace/Enter are handled by the box's KeyDown.
+				if (hk.shift)
+					render->vrKeyboardShift = !render->vrKeyboardShift;
+				else if (hk.backspace)
+				{
+					OnWindowKeyDown(EInputKey::IK_Backspace);
+					OnWindowKeyUp(EInputKey::IK_Backspace);
+				}
+				else if (hk.enter)
+				{
+					OnWindowKeyDown(EInputKey::IK_Enter);
+					OnWindowKeyUp(EInputKey::IK_Enter);
+				}
+				else if (hk.ch)
+				{
+					// UE1 key codes for letters/digits/space equal their uppercase ASCII value.
+					char up = (hk.ch >= 'a' && hk.ch <= 'z') ? (char)(hk.ch - 32) : hk.ch;
+					EInputKey kd = (EInputKey)(unsigned char)up;
+					OnWindowKeyDown(kd);
+					OnWindowKeyChar(std::string(1, hk.ch));
+					OnWindowKeyUp(kd);
+				}
+			}
+			return; // over a key: the keyboard owns this cursor, do not click the menu behind it
+		}
+	}
 
 	OnWindowMouseMove(cursorPos);
 
